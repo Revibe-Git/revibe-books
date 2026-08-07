@@ -443,7 +443,7 @@ License: MIT
   try{
     if(typeof React==='undefined'||typeof ReactDOM==='undefined') return showError('React failed to initialize.');
     if(typeof Papa==='undefined') return showError('PapaParse failed to initialize.');
-    window.__BUILD='B5';
+    window.__BUILD='B7';
 const h = React.createElement;
 const { useState, useMemo, useRef, useEffect, useCallback } = React;
 /* ---------- formatting ---------- */
@@ -465,7 +465,9 @@ const hstIn = amt => round2(amt - amt / (1 + HST_RATE));
 const LOCATIONS = ['Mississauga','Markham','Etobicoke','Shared'];
 const CATS = [
   // income
-  { id:'jane_deposits',  label:'Jane deposits (clinic revenue)', kind:'income',  hst:true  },
+  { id:'jane_deposits',  label:'Card revenue (Jane Payments)',   kind:'income',  hst:true  },
+  { id:'insurer_rev',    label:'Insurer & direct billing revenue', kind:'income', hst:false },
+  { id:'cash_rev',       label:'Cash, cheque & e-transfer revenue', kind:'income', hst:false },
   { id:'membership_rev', label:'Memberships & recovery revenue', kind:'income',  hst:true  },
   { id:'product_rev',    label:'Product sales',                  kind:'income',  hst:true  },
   { id:'other_income',   label:'Other income',                   kind:'income',  hst:false },
@@ -688,7 +690,7 @@ function lsGet(k, fb) { try { const v = localStorage.getItem(k); return v == nul
 function lsGetStr(k) { try { return localStorage.getItem(k) || ''; } catch(e){ return ''; } }
 function lsSet(k, v) { try { localStorage.setItem(k, typeof v === 'string' ? v : JSON.stringify(v)); } catch(e){} }
 function lsDel(k) { try { localStorage.removeItem(k); } catch(e){} }
-const DEFAULT_SETTINGS = { payrollSource:'ledger', hstSetAside:true };
+const DEFAULT_SETTINGS = { payrollSource:'ledger', hstSetAside:true, revenueSource:'jane' };
 /* ---------- CSV parsing: bank statements & Jane reports ----------
    Bank exports vary wildly (RBC/TD/Scotia/BMO/etc). This is a tolerant parser:
    it sniffs which columns are the date, the description, and the amount —
@@ -925,6 +927,159 @@ function parseJaneMonthly(aoa) {
   const good = blocks.filter(b => b.months.length);
   return good.length ? { blocks:good } : null;
 }
+/* Jane "Daily Transaction Report": Date, Payment Method, Total, Number of
+   Transactions — one row per day per method, fees as negative "… Processing
+   Fees" lines. The best Jane feed: real dates, revenue by payment method,
+   and fees, split by location. Aggregated per month into:
+     jane_deposits (card gross, per location) · jane_fees (per location, with
+     card gross stashed on ref) · insurer_rev · cash_rev */
+function parseJaneDaily(aoa) {
+  if (!aoa || !aoa.length) return null;
+  // find the header row
+  let hi = -1, cols = null;
+  for (let i = 0; i < Math.min(5, aoa.length); i++) {
+    const lc = (aoa[i] || []).map(x => String(x == null ? '' : x).toLowerCase().trim());
+    const d = lc.indexOf('date'), pm = lc.findIndex(x => x.indexOf('payment method') > -1), tot = lc.indexOf('total');
+    if (d > -1 && pm > -1 && tot > -1) { hi = i; cols = { d, pm, tot, n:lc.findIndex(x => x.indexOf('transaction') > -1) }; break; }
+  }
+  if (hi < 0) return null;
+  const agg = {}; // key: ym|bucket|loc -> { sum, n, cardGross (fees only) }
+  const bump = (key, amt, n) => {
+    agg[key] = agg[key] || { sum:0, n:0 };
+    agg[key].sum = round2(agg[key].sum + amt);
+    agg[key].n += n || 0;
+  };
+  let any = false;
+  aoa.slice(hi + 1).forEach(row => {
+    if (!row) return;
+    const date = parseDateAny(row[cols.d]);
+    const method = String(row[cols.pm] == null ? '' : row[cols.pm]).trim();
+    const amt = parseMoneyAny(row[cols.tot]);
+    if (!date || !method || isNaN(amt)) return;
+    const k = ym(date), lm = method.toLowerCase(), n = cols.n > -1 ? (parseInt(row[cols.n], 10) || 0) : 0;
+    const loc = lm.indexOf('markham') > -1 ? 'Markham' : lm.indexOf('mississauga') > -1 ? 'Mississauga' : null;
+    any = true;
+    if (lm.indexOf('jane payments') === 0) {
+      const L = loc || 'Mississauga'; // the unlocated AMEX account settles with Mississauga
+      if (lm.indexOf('processing fee') > -1) bump(k + '|fees|' + L, Math.abs(amt), n);
+      else bump(k + '|card|' + L, amt, n);
+    } else if (lm === 'cash' || lm.indexOf('cheque') > -1 || lm.indexOf('check') === 0 || lm.indexOf('etransfer') > -1 || lm.indexOf('e-transfer') > -1) {
+      bump(k + '|cash|', amt, n);
+    } else {
+      bump(k + '|insurer|', amt, n);
+    }
+  });
+  return any ? { agg } : null;
+}
+const DAILY_BUCKETS = {
+  card:    { category:'jane_deposits', kind:'income',  label:'Card revenue via Jane Payments' },
+  fees:    { category:'jane_fees',     kind:'expense', label:'Jane processing fees' },
+  insurer: { category:'insurer_rev',   kind:'income',  label:'Insurer & direct billing' },
+  cash:    { category:'cash_rev',      kind:'income',  label:'Cash, cheque & e-transfer' }
+};
+function buildJaneDailyRows(daily, defAcc, txns) {
+  // an existing jane-sourced line for the same month+category+location gets
+  // REPLACED on re-import (same id → upsert), so a mid-month import followed
+  // by the full month simply refreshes the figures.
+  const existing = {};
+  (txns || []).forEach(t => {
+    if (t.source !== 'jane') return;
+    existing[ym(t.date) + '|' + t.category + '|' + (t.location || '')] = { id:t.id, amount:t.amount };
+  });
+  const rows = [];
+  Object.keys(daily.agg).sort().forEach(key => {
+    const parts = key.split('|');
+    const k = parts[0], bucket = parts[1], loc = parts[2] || 'Shared';
+    const spec = DAILY_BUCKETS[bucket];
+    const a = daily.agg[key];
+    if (!spec || !a || Math.abs(a.sum) < 0.005) return;
+    if (a.sum < 0) return; // a month netting negative is a refund anomaly — leave for manual entry
+    const y = parseInt(k.slice(0,4), 10), m = parseInt(k.slice(5,7), 10);
+    const t = { id:uid(), date:monthEndIso(y, m),
+      description:spec.label + ' — ' + MONTHS[m-1] + ' ' + y + (loc !== 'Shared' ? ' (' + loc + ')' : '') + (a.n ? ' · ' + a.n + ' transactions' : ''),
+      category:spec.category, kind:spec.kind, location:loc, amount:round2(a.sum), hst:0,
+      account_id:defAcc, source:'jane' };
+    if (bucket === 'fees') {
+      const cg = daily.agg[k + '|card|' + loc];
+      t.ref = 'gross:' + (cg ? cg.sum : 0);
+    }
+    const ex = existing[k + '|' + spec.category + '|' + loc];
+    let status = 'new';
+    if (ex) { if (Math.abs(ex.amount - t.amount) < 0.005) status = 'same'; else { status = 'update'; t.id = ex.id; } }
+    t.hash = txHash(t);
+    rows.push({ t, bucket, loc, month:m, year:y, n:a.n, status,
+      dupe:status === 'same', include:status !== 'same' });
+  });
+  return rows;
+}
+/* Jane "Sales" export → accounts receivable. Recognized by its header
+   (Invoice #, Patient, Status, Collected, Balance). Each upload refreshes the
+   A/R book: invoices with a balance are added/updated; invoices in the file
+   now showing $0 owing clear off the list. */
+function parseJaneSales(aoa) {
+  if (!aoa || !aoa.length) return null;
+  let hi = -1, c = null;
+  for (let i = 0; i < Math.min(5, aoa.length); i++) {
+    const lc = (aoa[i] || []).map(x => String(x == null ? '' : x).toLowerCase().trim());
+    const inv = lc.findIndex(x => x === 'invoice #' || x === 'invoice'), bal = lc.indexOf('balance'), pat = lc.indexOf('patient');
+    if (inv > -1 && bal > -1 && pat > -1) {
+      hi = i;
+      c = { inv, bal, pat,
+        loc:lc.indexOf('location'), date:lc.findIndex(x => x === 'purchase date'), item:lc.indexOf('item'),
+        payer:lc.indexOf('payer'), status:lc.indexOf('status'), total:lc.indexOf('total'),
+        collected:lc.indexOf('collected'), staff:lc.findIndex(x => x === 'staff member') };
+      break;
+    }
+  }
+  if (hi < 0) return null;
+  const g = (row, i) => i > -1 ? String(row[i] == null ? '' : row[i]).trim() : '';
+  const gn = (row, i) => { const v = parseMoneyAny(row[i]); return isNaN(v) ? 0 : v; };
+  const rows = [];
+  aoa.slice(hi + 1).forEach(row => {
+    if (!row || !row.length) return;
+    const invoice = g(row, c.inv);
+    if (!invoice) return;
+    const lraw = g(row, c.loc).toLowerCase();
+    rows.push({ invoice,
+      date:parseDateAny(g(row, c.date)) || '',
+      patient:g(row, c.pat), item:g(row, c.item), payer:g(row, c.payer) || 'Patient',
+      status:g(row, c.status), staff:g(row, c.staff),
+      location:lraw.indexOf('markham') > -1 ? 'Markham' : lraw.indexOf('mississauga') > -1 ? 'Mississauga' : lraw.indexOf('etobicoke') > -1 ? 'Etobicoke' : 'Shared',
+      total:round2(gn(row, c.total)), collected:round2(gn(row, c.collected)), balance:round2(gn(row, c.bal)) });
+  });
+  if (!rows.length) return null;
+  const t = {
+    n:rows.length,
+    invoiced:round2(rows.reduce((s,r) => s + r.total, 0)),
+    collected:round2(rows.reduce((s,r) => s + r.collected, 0)),
+    balance:round2(rows.reduce((s,r) => s + r.balance, 0)),
+    open:rows.filter(r => r.balance > 0.005).length
+  };
+  return { rows, totals:t };
+}
+const AR_KEY = 'rvbk_ar_v1';
+function loadAR() { return lsGet(AR_KEY, { invoices:{}, updatedAt:'' }); }
+function applySalesToAR(store, salesRows, fileName) {
+  const inv = { ...(store.invoices || {}) };
+  let added = 0, updated = 0, cleared = 0;
+  salesRows.forEach(r => {
+    if (r.balance > 0.005) {
+      if (!inv[r.invoice]) added++;
+      else if (Math.abs(inv[r.invoice].balance - r.balance) > 0.005) updated++;
+      inv[r.invoice] = { invoice:r.invoice, date:r.date, patient:r.patient, item:r.item, payer:r.payer,
+        status:r.status, location:r.location, total:r.total, balance:r.balance, seen:todayIso() };
+    } else if (inv[r.invoice]) { delete inv[r.invoice]; cleared++; }
+  });
+  const next = { invoices:inv, updatedAt:new Date().toISOString(), lastFile:fileName || '' };
+  lsSet(AR_KEY, next);
+  return { store:next, added, updated, cleared,
+    totalAR:round2(Object.values(inv).reduce((s,x) => s + x.balance, 0)), openN:Object.keys(inv).length };
+}
+function arAgeBucket(dateIso) {
+  if (!dateIso) return '0–30 days';
+  const days = Math.floor((Date.parse(todayIso() + 'T12:00:00') - Date.parse(dateIso + 'T12:00:00')) / 86400000);
+  return days <= 30 ? '0–30 days' : days <= 60 ? '31–60 days' : days <= 90 ? '61–90 days' : '90+ days';
+}
 function monthEndIso(year, m) {
   const last = new Date(year, m, 0).getDate();
   return year + '-' + ('0' + m).slice(-2) + '-' + ('0' + last).slice(-2);
@@ -963,6 +1118,9 @@ function rollup(txns, opts) {
     if (o.year && (t.date||'').slice(0,4) !== o.year) return;
     if (o.location && o.location !== 'all' && t.location !== o.location) return;
     if (o.skipCat && o.skipCat[t.category]) return;
+    // when revenue is booked from Jane reports, bank deposit lines are the same
+    // money arriving — keep them for balances & reconciliation, not the P&L
+    if (o.skipBankJaneDeposits && t.source === 'bank' && t.kind === 'income' && t.category === 'jane_deposits') return;
     if (!inPL(t)) {
       // still track HST remitted etc. elsewhere; skip for P&L
       return;
@@ -1167,7 +1325,7 @@ function OverviewTab(p) {
   const payEst = useMemo(() => nextPayrollEstimate(ledger), [ledger]);
   // HST set-aside: collected − ITCs (incl. HST paid to contractors via payroll), year to date, minus remittances already made
   const year = todayIso().slice(0,4);
-  const yr = useMemo(() => rollup(txns, { year }), [txns, year]);
+  const yr = useMemo(() => rollup(txns, { year, skipBankJaneDeposits:settings.revenueSource !== 'bank' }), [txns, year, settings.revenueSource]);
   const pbm = useMemo(() => payrollByMonth(ledger), [ledger]);
   const payrollHstYtd = round2(Object.keys(pbm).filter(k => k.slice(0,4) === year).reduce((s,k) => s + pbm[k].hst, 0));
   const remitted = round2(txns.filter(t => t.category === 'hst_remit' && (t.date||'').slice(0,4) === year).reduce((s,t) => s + (t.amount||0), 0));
@@ -1181,14 +1339,14 @@ function OverviewTab(p) {
     for (let i = 5; i >= 0; i--) {
       const dd = new Date(d.getFullYear(), d.getMonth() - i, 15);
       const key = dd.toISOString().slice(0,7);
-      const r = rollup(txns, { month:key, skipCat:settings.payrollSource === 'ledger' ? { payroll:1 } : null });
+      const r = rollup(txns, { month:key, skipCat:settings.payrollSource === 'ledger' ? { payroll:1 } : null, skipBankJaneDeposits:settings.revenueSource !== 'bank' });
       const pay = settings.payrollSource === 'ledger' ? ((pbm[key] && pbm[key].net) || 0) : 0;
       out.push({ key, inc:r.income, exp:round2(r.expense + pay) });
     }
     return out;
   }, [txns, pbm, settings.payrollSource]);
   // this month's expense breakdown
-  const mo = useMemo(() => rollup(txns, { month:nowMonth, skipCat:settings.payrollSource === 'ledger' ? { payroll:1 } : null }), [txns, nowMonth, settings.payrollSource]);
+  const mo = useMemo(() => rollup(txns, { month:nowMonth, skipCat:settings.payrollSource === 'ledger' ? { payroll:1 } : null, skipBankJaneDeposits:settings.revenueSource !== 'bank' }), [txns, nowMonth, settings.payrollSource, settings.revenueSource]);
   const moPay = settings.payrollSource === 'ledger' ? ((pbm[nowMonth] && pbm[nowMonth].net) || 0) : 0;
   const expItems = Object.keys(mo.byCat).filter(c => mo.byCat[c].kind === 'expense')
     .map(c => ({ label:catLabel(c), value:mo.byCat[c].amt }));
@@ -1265,6 +1423,18 @@ function ImportPanel(p) {
       let aoa;
       if (isXlsx) aoa = await readXlsxRows(buf);
       else aoa = Papa.parse(new TextDecoder().decode(buf), { skipEmptyLines:true }).data;
+      const sales = parseJaneSales(aoa);
+      if (sales) {
+        setPreview({ kind:'sales', sales, fileName:f.name, issues:[],
+          rows:sales.rows.filter(r => r.balance > 0.005).sort((a,b) => b.balance - a.balance) });
+        return;
+      }
+      const daily = parseJaneDaily(aoa);
+      if (daily) {
+        setPreview({ kind:'daily', fileName:f.name, issues:[],
+          rows:buildJaneDailyRows(daily, defAcc, p.txns) });
+        return;
+      }
       const monthly = parseJaneMonthly(aoa);
       if (monthly) {
         const year = guessJaneYear(monthly);
@@ -1314,6 +1484,11 @@ function ImportPanel(p) {
   });
   const toggleRow = i => setPreview(pv => { const rows = pv.rows.slice(); rows[i] = { ...rows[i], include:!rows[i].include }; return { ...pv, rows }; });
   const doImport = () => {
+    if (preview.kind === 'sales') {
+      p.onUpdateAR(preview.sales.rows, preview.fileName);
+      setPreview(null);
+      return;
+    }
     const take = preview.rows.filter(r => r.include).map(r => ({ ...r.t, location:r.t.location || defLoc, account_id:r.t.account_id || defAcc }));
     if (!take.length) { window.alert('Nothing selected to import.'); return; }
     p.onImport(take);
@@ -1334,9 +1509,9 @@ function ImportPanel(p) {
         onDragOver:e => { e.preventDefault(); setHot(true); }, onDragLeave:() => setHot(false),
         onDrop:e => { e.preventDefault(); setHot(false); onFile(e.dataTransfer.files); } },
       h('div', { className:'ic' }, '↑'),
-      h('h2', null, mode === 'jane' ? 'Drop the Jane Monthly Processing Report' : 'Drop a bank statement CSV'),
+      h('h2', null, mode === 'jane' ? 'Drop a Jane report' : 'Drop a bank statement CSV'),
       h('p', null, mode === 'jane'
-        ? 'The Monthly Processing Report straight from Jane Payments (the file works as-is, even though Jane names it .csv). Each location’s monthly processing fees are recorded automatically under “Jane processing fees.” Nothing saves until you review the preview — re-uploading the same months later just skips them as duplicates.'
+        ? h('span', null, 'Drops any of three Jane reports, auto-detected: the ', h('b', null, 'Daily Transaction Report'), ' (revenue by payment method + processing fees — the main monthly upload), a ', h('b', null, 'Sales export'), ' (updates accounts receivable — who still owes you), or the ', h('b', null, 'Monthly Processing Report'), ' (fees only). Nothing saves until you review the preview.')
         : 'Any bank’s CSV export works — columns are detected automatically (date, description, amount or debit/credit). Every line is auto-categorized and shown for review; duplicates you’ve already imported are skipped.'),
       h('input', { ref:fileRef, type:'file', accept:mode === 'jane' ? '.csv,.xlsx' : '.csv', style:{ display:'none' }, onChange:e => onFile(e.target.files) }),
       h('button', { className:'filebtn', onClick:() => fileRef.current && fileRef.current.click() }, mode === 'jane' ? 'Choose file' : 'Choose CSV file'))
@@ -1344,7 +1519,7 @@ function ImportPanel(p) {
       preview.issues.map((x,i) => h('div', { className:'errbox', key:i, style:{ marginBottom:10 } }, h('span', null, '⚠'), h('span', null, x))),
       h('div', { style:{ display:'flex', gap:10, alignItems:'center', flexWrap:'wrap', marginBottom:10 } },
         h('span', { style:{ fontWeight:600, fontSize:13 } }, preview.fileName),
-        h('span', { className:'badge b-teal' }, preview.rows.length + (preview.kind === 'monthly' ? ' months' : ' rows')),
+        h('span', { className:'badge b-teal' }, preview.rows.length + (preview.kind === 'monthly' ? ' months' : preview.kind === 'daily' ? ' monthly lines' : ' rows')),
         nDupe ? h('span', { className:'badge b-amber', title:'Already imported before — unticked by default' }, nDupe + ' duplicates') : null,
         preview.gross ? h('span', { className:'dim', style:{ fontSize:12 } }, 'on ~' + money(preview.gross) + ' processed') : null,
         preview.kind === 'monthly' && preview.monthly ? h('span', { style:{ display:'inline-flex', alignItems:'center', gap:6 } },
@@ -1354,8 +1529,50 @@ function ImportPanel(p) {
         h('span', { style:{ flex:1 } }),
         h('button', { className:'ghost', onClick:() => setPreview(null) }, 'Cancel'),
         h('button', { className:'ghost primary', onClick:doImport },
-          'Import ' + nInc + ' selected' + (preview.kind === 'monthly' ? ' · ' + money(round2(preview.rows.filter(r => r.include).reduce((s,r) => s + r.t.amount, 0))) : ''))),
-      preview.kind === 'monthly'
+          preview.kind === 'sales'
+            ? 'Update A/R — ' + preview.rows.length + ' open · ' + money(preview.sales.totals.balance)
+            : 'Import ' + nInc + ' selected' + (preview.kind === 'monthly' ? ' · ' + money(round2(preview.rows.filter(r => r.include).reduce((s,r) => s + r.t.amount, 0))) : ''))),
+      preview.kind === 'sales'
+      ? h('div', null,
+        h('div', { style:{ display:'flex', gap:14, flexWrap:'wrap', marginBottom:10, fontSize:12.5 } },
+          h('span', null, h('b', null, preview.sales.totals.n), h('span', { className:'dim' }, ' invoice lines')),
+          h('span', null, h('b', null, money(preview.sales.totals.invoiced)), h('span', { className:'dim' }, ' invoiced')),
+          h('span', null, h('b', { className:'v-green' }, money(preview.sales.totals.collected)), h('span', { className:'dim' }, ' collected')),
+          h('span', null, h('b', { className:'v-amber' }, money(preview.sales.totals.balance)), h('span', { className:'dim' }, ' outstanding on ' + preview.sales.totals.open + ' invoices'))),
+        h('div', { style:{ maxHeight:400, overflow:'auto', border:'1px solid var(--line)', borderRadius:9 } },
+          h('table', null,
+            h('thead', null, h('tr', null,
+              h('th', null, 'Date'), h('th', null, 'Patient'), h('th', null, 'Item'),
+              h('th', null, 'Payer'), h('th', null, 'Status'), h('th', { className:'r' }, 'Owing'))),
+            h('tbody', null,
+              !preview.rows.length ? h('tr', null, h('td', { colSpan:6, className:'dim', style:{ padding:16, textAlign:'center' } }, 'No open balances in this report — importing will clear any of these invoices previously tracked as owing.')) : null,
+              preview.rows.map((r,i) => h('tr', { key:i },
+                h('td', { className:'tnum dim', style:{ whiteSpace:'nowrap' } }, r.date),
+                h('td', null, r.patient),
+                h('td', { style:{ maxWidth:240, overflow:'hidden', textOverflow:'ellipsis' } }, r.item),
+                h('td', { className:'dim' }, r.payer),
+                h('td', null, h('span', { className:'badge ' + (r.status === 'unpaid' ? 'b-amber' : 'b-gray') }, r.status || '—')),
+                h('td', { className:'r tnum', style:{ fontWeight:600 } }, money(r.balance))))))))
+      : preview.kind === 'daily'
+      ? h('div', { style:{ maxHeight:460, overflow:'auto', border:'1px solid var(--line)', borderRadius:9 } },
+        h('table', null,
+          h('thead', null, h('tr', null,
+            h('th', null, ''), h('th', null, 'Month'), h('th', null, 'Location'), h('th', null, 'Line'),
+            h('th', { className:'r' }, 'Transactions'), h('th', { className:'r' }, 'Amount'), h('th', null, ''))),
+          h('tbody', null, preview.rows.map((r,i) => h('tr', { key:i, style:{ opacity:r.include ? 1 : 0.45 } },
+            h('td', null, h('input', { type:'checkbox', checked:r.include, onChange:() => toggleRow(i),
+              style:{ width:15, height:15, accentColor:'var(--teal)' } })),
+            h('td', { style:{ whiteSpace:'nowrap', fontWeight:600 } }, MONTHS[r.month - 1] + ' ' + r.year),
+            h('td', null, r.loc),
+            h('td', null, DAILY_BUCKETS[r.bucket].label),
+            h('td', { className:'r tnum dim' }, r.n || '—'),
+            h('td', { className:'r tnum', style:{ fontWeight:600, color:r.t.kind === 'income' ? 'var(--green)' : 'var(--coral)' } },
+              (r.t.kind === 'income' ? '+' : '−') + money(r.t.amount)),
+            h('td', null,
+              r.status === 'same' ? h('span', { className:'badge b-amber' }, 'already imported')
+              : r.status === 'update' ? h('span', { className:'badge b-purple', title:'A different figure for this month is already in the books — importing replaces it (e.g. a partial month refreshed with the full month)' }, 'updates existing')
+              : h('span', { className:'badge b-green' }, 'new')))))))
+      : preview.kind === 'monthly'
       ? h('div', { style:{ maxHeight:420, overflow:'auto', border:'1px solid var(--line)', borderRadius:9 } },
         h('table', null,
           h('thead', null, h('tr', null,
@@ -1387,7 +1604,11 @@ function ImportPanel(p) {
             h('td', { className:'r tnum', style:{ color:r.t.kind === 'income' ? 'var(--green)' : 'var(--ink)' } },
               (r.t.kind === 'income' ? '+' : '−') + money(r.t.amount).replace('$','$'))))))),
       h('div', { className:'dim', style:{ fontSize:11.5, marginTop:8, lineHeight:1.5 } },
-        preview.kind === 'monthly'
+        preview.kind === 'sales'
+          ? 'A Sales report updates the accounts-receivable book (Revenue tab): invoices with a balance are tracked as owing, and any previously-tracked invoice this report now shows as paid clears automatically. Upload the latest Sales export any time to refresh who owes what — it never creates income or expense entries.'
+          : preview.kind === 'daily'
+          ? 'The Daily Transaction Report books the full picture per month: card revenue via Jane Payments (per location — the unlocated AMEX account is counted with Mississauga), insurer/direct-billing revenue, cash/cheque/e-transfer, and processing fees. Re-importing an updated report later simply refreshes those months. HST collected varies by service mix, so it isn’t auto-split on revenue lines — your accountant can compute it from Jane’s tax report, or set it per line.'
+          : preview.kind === 'monthly'
           ? 'Each month’s fee is recorded on the last day of that month, tagged to its clinic location. Payment-processing fees are HST-exempt, so no HST is booked on them (editable per line after import if your accountant treats them differently). Double-check the year above — Jane’s report doesn’t include it.'
           : 'HST is auto-estimated (13% embedded) for categories that normally carry it — you can fix any line after import. Categorize e-transfers to contractors as “Payroll & contractors” (they’re excluded from the P&L when payroll comes from the payroll dashboard, so nothing is double-counted).')));
 }
@@ -1444,7 +1665,8 @@ function LedgerTab(p) {
       h(Fld, { label:'Search', value:q, onChange:setQ, placeholder:'find a transaction…', flex:1.4, min:150 }),
       h('button', { className:'ghost' + (showImport ? ' primary' : ''), onClick:() => setShowImport(v => !v), style:{ padding:'8px 14px' } }, showImport ? 'Hide import' : '⬆ Import CSV'),
       h('button', { className:'ghost primary', onClick:() => setAdding(v => !v), style:{ padding:'8px 14px' } }, adding ? 'Close' : '+ Add entry')),
-    showImport ? h(ImportPanel, { txns:p.txns, accounts:p.accounts, onImport:rows => { p.onSave(rows); setShowImport(false); } }) : null,
+    showImport ? h(ImportPanel, { txns:p.txns, accounts:p.accounts, onImport:rows => { p.onSave(rows); setShowImport(false); },
+      onUpdateAR:(rows, fn) => { p.onUpdateAR(rows, fn); setShowImport(false); } }) : null,
     adding ? h('div', { className:'card', style:{ marginBottom:14, border:'1px solid var(--teal)' } },
       h('div', { className:'eyebrow', style:{ marginBottom:10 } }, 'New entry'),
       h(TxForm, { value:draft, onChange:setDraft, accounts:p.accounts }),
@@ -1519,12 +1741,34 @@ function PayrollTab(p) {
 /* ===================== Revenue & bank reconciliation ===================== */
 function RevenueTab(p) {
   const { revLines, txns, signedIn } = p;
-  const rbm = useMemo(() => revenueByMonth(revLines), [revLines]);
+  const rbmSnap = useMemo(() => revenueByMonth(revLines), [revLines]);
   const jbm = useMemo(() => janeByMonth(txns), [txns]);
+  /* revenue booked from imported Jane daily reports (all payment methods) —
+     preferred over pay-run snapshots for any month where it exists */
+  const janeRevByMonth = useMemo(() => {
+    const m = {};
+    txns.forEach(t => {
+      if (t.source !== 'jane' || t.kind !== 'income') return;
+      const k = ym(t.date);
+      if (!k) return;
+      m[k] = m[k] || { collected:0, n:0 };
+      m[k].collected = round2(m[k].collected + (t.amount || 0));
+      m[k].n++;
+    });
+    return m;
+  }, [txns]);
+  const rbm = useMemo(() => {
+    const m = { ...rbmSnap };
+    Object.keys(janeRevByMonth).forEach(k => { m[k] = { ...janeRevByMonth[k], invoiced:(rbmSnap[k] && rbmSnap[k].invoiced) || 0, fromJane:true }; });
+    return m;
+  }, [rbmSnap, janeRevByMonth]);
   const depositsByMonth = useMemo(() => {
     const m = {};
     txns.forEach(t => {
-      if (t.category !== 'jane_deposits' || t.kind !== 'income') return;
+      // only money that actually arrived in the bank — never the Jane-report
+      // revenue lines themselves (source 'jane'), or the column would just
+      // mirror the revenue and the reconciliation would prove nothing
+      if (t.category !== 'jane_deposits' || t.kind !== 'income' || t.source !== 'bank') return;
       const k = ym(t.date);
       if (k) m[k] = round2((m[k] || 0) + (t.amount || 0));
     });
@@ -1549,7 +1793,7 @@ function RevenueTab(p) {
   return h('div', null,
     h('div', { className:'metrics' },
       h(Metric, { lab:'Revenue this month', val:money(revThis), cls:'v-green',
-        hint:rbm[nowMonth] ? (rbm[nowMonth].n + ' invoice lines · live from pay-run reports') : 'no pay-run data for this month yet' }),
+        hint:rbm[nowMonth] ? (rbm[nowMonth].fromJane ? 'from your imported Jane daily report' : (rbm[nowMonth].n + ' invoice lines · from pay-run reports')) : 'no revenue data for this month yet' }),
       h(Metric, { lab:'Revenue YTD (' + year + ')', val:money(revYtd), hint:'collected, all payment methods' }),
       h(Metric, { lab:'Jane fees YTD', val:money(feesYtd), mcls:'m-coral', cls:'v-coral', hint:'from your monthly Jane fee imports' }),
       h(Metric, { lab:'Expected into bank — this month', val:money(expThis), mcls:'m-green', cls:'v-teal',
@@ -1589,12 +1833,67 @@ function RevenueTab(p) {
                   : h('td', { className:'r tnum', style:{ fontWeight:600, color:Math.abs(diff) < 25 ? 'var(--green)' : 'var(--amber)' } },
                       (diff >= 0 ? '+' : '−') + money(Math.abs(diff)),
                       Math.abs(diff) < 25 ? ' ✓' : '')); })))),
+      h(ARSection, { ar:p.ar }),
       h('div', { className:'dim', style:{ fontSize:11.5, marginTop:10, lineHeight:1.6 } },
         h('b', null, 'How to read this: '),
-        '“Revenue collected” is every payment on the Jane reports inside your saved pay runs (deduped by invoice, all payment methods — card, cash, e-transfer, insurers). ',
+        '“Revenue collected” prefers your imported Jane Daily Transaction Reports (all payment methods); months without one fall back to the Jane reports inside your saved pay runs (deduped by invoice). ',
         '“Through Jane Payments” is the card-processed slice from your monthly Jane fee report; that minus fees is what Jane actually pays out to the bank. ',
         'Import your bank statement and the deposits column fills in — a green ✓ means Jane’s payouts landed as expected; an amber gap means deposits are missing, still in transit, or some card revenue didn’t come through Jane. ',
         'Months where a payment method column shows “—” just need that source imported.')));
+}
+/* accounts receivable — who owes what, from the latest Sales report upload */
+function ARSection(p) {
+  const inv = Object.values((p.ar && p.ar.invoices) || {});
+  const [showAll, setShowAll] = useState(false);
+  const total = round2(inv.reduce((s,x) => s + x.balance, 0));
+  const buckets = useMemo(() => {
+    const m = { '0–30 days':0, '31–60 days':0, '61–90 days':0, '90+ days':0 };
+    inv.forEach(x => { m[arAgeBucket(x.date)] = round2(m[arAgeBucket(x.date)] + x.balance); });
+    return m;
+  }, [p.ar]);
+  const byPatient = useMemo(() => {
+    const m = {};
+    inv.forEach(x => {
+      const k = x.patient || '(no name)';
+      m[k] = m[k] || { patient:k, n:0, balance:0, oldest:'', items:[] };
+      m[k].n++;
+      m[k].balance = round2(m[k].balance + x.balance);
+      if (!m[k].oldest || (x.date && x.date < m[k].oldest)) m[k].oldest = x.date;
+      m[k].items.push(x);
+    });
+    return Object.values(m).sort((a,b) => b.balance - a.balance);
+  }, [p.ar]);
+  const shown = showAll ? byPatient : byPatient.slice(0, 12);
+  return h('div', { style:{ marginTop:18 } },
+    h('div', { className:'sec-h' },
+      h('h3', null, 'Accounts receivable'),
+      h('span', { className:'dim', style:{ fontSize:12 } },
+        inv.length ? inv.length + ' open invoices · updated ' + ((p.ar.updatedAt || '').slice(0,10) || '—') : 'upload a Jane Sales report to track who owes you')),
+    !inv.length
+      ? h('div', { className:'card', style:{ padding:18 } },
+          h('span', { className:'dim', style:{ fontSize:12.5 } }, 'Transactions → Import CSV → Jane fees report → drop a ', h('b', null, 'Sales export'), ' — open balances land here, and re-uploads clear whatever has since been paid.'))
+      : h('div', null,
+        h('div', { style:{ display:'flex', gap:12, flexWrap:'wrap', marginBottom:10 } },
+          h('div', { className:'metric', style:{ flex:'1 1 170px' } },
+            h('div', { className:'lab' }, 'Owed to you'),
+            h('div', { className:'val v-amber' }, money(total))),
+          Object.entries(buckets).filter(([,v]) => v > 0).map(([k,v]) => h('div', { className:'metric', style:{ flex:'1 1 140px' }, key:k },
+            h('div', { className:'lab' }, k),
+            h('div', { className:'val', style:{ fontSize:20, color:k === '0–30 days' ? 'var(--ink)' : k === '31–60 days' ? 'var(--amber)' : 'var(--red)' } }, money(v))))),
+        h('div', { className:'card', style:{ padding:'6px 10px' } },
+          h('table', null,
+            h('thead', null, h('tr', null,
+              h('th', null, 'Patient / payer'), h('th', null, 'Open invoices'), h('th', null, 'Oldest'), h('th', { className:'r' }, 'Owing'))),
+            h('tbody', null, shown.map(x => h('tr', { key:x.patient },
+              h('td', { style:{ fontWeight:600 } }, x.patient,
+                x.items.some(i => i.payer && i.payer !== 'Patient') ? h('span', { className:'badge b-purple', style:{ marginLeft:6 } }, 'insurer') : null),
+              h('td', { className:'dim' }, x.n + ' — ' + x.items.slice(0,2).map(i => i.item).join(' · ').slice(0, 60) + (x.n > 2 ? '…' : '')),
+              h('td', { className:'tnum dim' }, x.oldest || '—',
+                arAgeBucket(x.oldest) !== '0–30 days' ? h('span', { className:'badge ' + (arAgeBucket(x.oldest) === '31–60 days' ? 'b-amber' : 'b-red'), style:{ marginLeft:6 } }, arAgeBucket(x.oldest)) : null),
+              h('td', { className:'r tnum', style:{ fontWeight:700 } }, money(x.balance)))))),
+          byPatient.length > 12 ? h('div', { style:{ padding:'8px 4px' } },
+            h('button', { className:'link', style:{ fontSize:12 }, onClick:() => setShowAll(v => !v) },
+              showAll ? 'Show top 12' : 'Show all ' + byPatient.length + ' patients')) : null)));
 }
 /* ===================== Accountant view ===================== */
 function AccountantTab(p) {
@@ -1613,8 +1912,9 @@ function AccountantTab(p) {
   const skip = settings.payrollSource === 'ledger' ? { payroll:1 } : null;
   const perLoc = useMemo(() => {
     const m = {};
-    LOCATIONS.forEach(l => { m[l] = rollup(txns, { ...opts, location:l, skipCat:skip }); });
-    m.__all = rollup(txns, { ...opts, skipCat:skip });
+    const g = { skipBankJaneDeposits:settings.revenueSource !== 'bank' };
+    LOCATIONS.forEach(l => { m[l] = rollup(txns, { ...opts, ...g, location:l, skipCat:skip }); });
+    m.__all = rollup(txns, { ...opts, ...g, skipCat:skip });
     return m;
   }, [txns, period, settings.payrollSource]);
   const payAmt = useMemo(() => {
@@ -1771,7 +2071,7 @@ function BudgetTab(p) {
   const totA = round2(rows.reduce((s,r) => s + r.actual, 0));
   const totAvg = round2(rows.reduce((s,r) => s + r.avg, 0));
   // projection: income avg last 3 − budget (or avg) expenses
-  const incAvg = useMemo(() => round2(last3.reduce((s,k) => s + rollup(txns, { month:k }).income, 0) / 3), [txns, last3]);
+  const incAvg = useMemo(() => round2(last3.reduce((s,k) => s + rollup(txns, { month:k, skipBankJaneDeposits:settings.revenueSource !== 'bank' }).income, 0) / 3), [txns, last3, settings.revenueSource]);
   const projExp = rows.reduce((s,r) => s + (r.budget != null ? r.budget : r.avg), 0);
   const proj = round2(incAvg - projExp);
   return h('div', null,
@@ -1887,6 +2187,13 @@ function SettingsTab(p) {
           h('span', null, h('span', { style:{ fontWeight:600, fontSize:13 } }, 'Pull payroll from the payroll dashboard (recommended)'),
             h('span', { className:'dim', style:{ display:'block', fontSize:12, lineHeight:1.5, marginTop:2 } },
               'Saved pay runs flow in automatically as the payroll expense; bank lines categorized “Payroll & contractors” are excluded from the P&L so nothing is double-counted. Untick to book payroll from bank transactions instead.'))),
+        h('label', { style:{ display:'flex', gap:10, alignItems:'flex-start', cursor:'pointer', marginBottom:14 } },
+          h('input', { type:'checkbox', checked:p.settings.revenueSource !== 'bank',
+            onChange:e => p.onSetSettings({ ...p.settings, revenueSource:e.target.checked ? 'jane' : 'bank' }),
+            style:{ marginTop:2, width:15, height:15, accentColor:'var(--teal)' } }),
+          h('span', null, h('span', { style:{ fontWeight:600, fontSize:13 } }, 'Book revenue from Jane reports (recommended)'),
+            h('span', { className:'dim', style:{ display:'block', fontSize:12, lineHeight:1.5, marginTop:2 } },
+              'Revenue comes from your imported Jane Daily Transaction Reports (cards, insurers, cash). Bank deposit lines categorized “Card revenue (Jane Payments)” stay in the books for balances and the deposit reconciliation, but are excluded from the P&L so the same money isn’t counted twice. Untick to book revenue from bank deposits instead.'))),
         h('label', { style:{ display:'flex', gap:10, alignItems:'flex-start', cursor:'pointer' } },
           h('input', { type:'checkbox', checked:!!p.settings.hstSetAside,
             onChange:e => p.onSetSettings({ ...p.settings, hstSetAside:e.target.checked }),
@@ -1905,6 +2212,13 @@ function App() {
   const [settings, setSettings] = useState(() => ({ ...DEFAULT_SETTINGS, ...lsGet(LS.settings, {}) }));
   const [ledger, setLedger] = useState([]);
   const [revLines, setRevLines] = useState(() => lsGet('rvbk_rev_v1', []));
+  const [ar, setAr] = useState(loadAR);
+  const updateAR = (salesRows, fileName) => {
+    const res = applySalesToAR(ar, salesRows, fileName);
+    setAr(res.store);
+    setMsg('A/R updated — ' + res.openN + ' open invoices · ' + money(res.totalAR) + ' owing'
+      + (res.cleared ? ' · ' + res.cleared + ' cleared as paid' : ''));
+  };
   const [token, setToken] = useState(() => lsGetStr(LS.tok));
   const [refreshTok, setRefreshTok] = useState(() => lsGetStr(LS.refresh));
   const [user, setUser] = useState(() => lsGetStr(LS.user));
@@ -2136,8 +2450,8 @@ function App() {
     h('div', { className:'tabs no-print' }, TABS.map(([id, label]) =>
       h('button', { key:id, className:'tab' + (tab === id ? ' on' : ''), onClick:() => setTab(id) }, label))),
     tab === 'overview' ? h(OverviewTab, { txns, accounts, recs, ledger, settings }) : null,
-    tab === 'ledger' ? h(LedgerTab, { txns, accounts, onSave:saveTxns, onDelete:deleteTx }) : null,
-    tab === 'revenue' ? h(RevenueTab, { revLines, txns, signedIn:!!token }) : null,
+    tab === 'ledger' ? h(LedgerTab, { txns, accounts, onSave:saveTxns, onDelete:deleteTx, onUpdateAR:updateAR }) : null,
+    tab === 'revenue' ? h(RevenueTab, { revLines, txns, signedIn:!!token, ar }) : null,
     tab === 'payroll' ? h(PayrollTab, { ledger, settings, signedIn:!!token }) : null,
     tab === 'accountant' ? h(AccountantTab, { txns, ledger, settings, accounts }) : null,
     tab === 'budget' ? h(BudgetTab, { txns, buds, ledger, settings, onSetBudget:setBudget }) : null,
@@ -2146,7 +2460,7 @@ function App() {
       h('span', { style:{ display:'block', marginTop:6, fontWeight:600, color:'var(--pine)' } }, 'build ' + window.__BUILD)));
 }
 /* pure functions exposed for automated smoke-testing; harmless in production */
-window.__BK = { parseDateAny, parseMoneyAny, sniffBankColumns, normalizeBankCsv, normalizeJaneFees, autoCategory, rollup, hstIn, txHash, payrollByMonth, nextPayrollEstimate, upcomingRecurring, readXlsxRows, parseJaneMonthly, guessJaneYear, buildJaneMonthlyRows, monthEndIso, revenueLinesFromLedger, revenueByMonth, janeByMonth };
+window.__BK = { parseDateAny, parseMoneyAny, sniffBankColumns, normalizeBankCsv, normalizeJaneFees, autoCategory, rollup, hstIn, txHash, payrollByMonth, nextPayrollEstimate, upcomingRecurring, readXlsxRows, parseJaneMonthly, guessJaneYear, buildJaneMonthlyRows, monthEndIso, revenueLinesFromLedger, revenueByMonth, janeByMonth, parseJaneDaily, buildJaneDailyRows, parseJaneSales, applySalesToAR, arAgeBucket, loadAR };
 ReactDOM.createRoot(document.getElementById('root')).render(h(App));
   }catch(e){ showError((e&&(e.message||String(e)))||'Unknown error'); if(window.console) console.error(e); }
 })();
