@@ -443,7 +443,7 @@ License: MIT
   try{
     if(typeof React==='undefined'||typeof ReactDOM==='undefined') return showError('React failed to initialize.');
     if(typeof Papa==='undefined') return showError('PapaParse failed to initialize.');
-    window.__BUILD='B8';
+    window.__BUILD='B10';
 const h = React.createElement;
 const { useState, useMemo, useRef, useEffect, useCallback } = React;
 /* ---------- formatting ---------- */
@@ -1525,7 +1525,8 @@ function ImportPanel(p) {
     h('div', { style:{ display:'flex', gap:8, alignItems:'center', flexWrap:'wrap', marginBottom:12 } },
       h('div', { className:'eyebrow', style:{ flex:1 } }, 'Import a CSV'),
       h('button', { className:'ghost' + (mode === 'bank' ? ' primary' : ''), onClick:() => { setMode('bank'); setPreview(null); } }, 'Bank statement'),
-      h('button', { className:'ghost' + (mode === 'jane' ? ' primary' : ''), onClick:() => { setMode('jane'); setPreview(null); } }, 'Jane fees report'),
+      h('button', { className:'ghost' + (mode === 'jane' ? ' primary' : ''), onClick:() => { setMode('jane'); setPreview(null); },
+        title:'Daily Transaction Report · Sales export (A/R) · Monthly Processing Report — auto-detected' }, 'Jane reports'),
       h('span', { style:{ flex:'0 0 8px' } }),
       h(Fld, { label:'Default location', select:true, value:defLoc, onChange:setDefLoc, flex:'0 0 140px', children:LocOptions() }),
       p.accounts.length ? h(Fld, { label:'Into account', select:true, value:defAcc, onChange:setDefAcc, flex:'0 0 150px',
@@ -1932,7 +1933,7 @@ function ARSection(p) {
         '⬇ Follow-up list for front desk (CSV)')) : null,
     !inv.length
       ? h('div', { className:'card', style:{ padding:18 } },
-          h('span', { className:'dim', style:{ fontSize:12.5 } }, 'Transactions → Import CSV → Jane fees report → drop a ', h('b', null, 'Sales export'), ' — open balances land here, and re-uploads clear whatever has since been paid.'))
+          h('span', { className:'dim', style:{ fontSize:12.5 } }, 'Transactions → Import CSV → Jane reports → drop a ', h('b', null, 'Sales export'), ' — open balances land here, and re-uploads clear whatever has since been paid.'))
       : h('div', null,
         h('div', { style:{ display:'flex', gap:12, flexWrap:'wrap', marginBottom:10 } },
           h('div', { className:'metric', style:{ flex:'1 1 170px' } },
