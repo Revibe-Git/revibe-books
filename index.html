@@ -443,7 +443,7 @@ License: MIT
   try{
     if(typeof React==='undefined'||typeof ReactDOM==='undefined') return showError('React failed to initialize.');
     if(typeof Papa==='undefined') return showError('PapaParse failed to initialize.');
-    window.__BUILD='B10';
+    window.__BUILD='B11';
 const h = React.createElement;
 const { useState, useMemo, useRef, useEffect, useCallback } = React;
 /* ---------- formatting ---------- */
@@ -1069,6 +1069,71 @@ function parseJaneSales(aoa) {
   };
   return { rows, totals:t };
 }
+/* Jane "Payouts Report": per-location blocks of
+     Date Created, Date Deposited, Payout Amount, Payout Status
+   — the money Jane actually sent to the bank. Closes the loop:
+   revenue → fees → payouts → bank deposits. */
+function parseJanePayouts(aoa) {
+  if (!aoa || !aoa.length) return null;
+  let loc = null, cols = null;
+  const rows = [];
+  aoa.forEach(row => {
+    if (!row || !row.length) return;
+    const c0 = String(row[0] == null ? '' : row[0]).trim();
+    const lc = row.map(x => String(x == null ? '' : x).toLowerCase().trim());
+    const mBlock = c0.match(/^jane\s*payments?\s+(.+)$/i);
+    if (mBlock) { loc = mBlock[1].trim(); cols = null; return; }
+    if (lc.some(x => x.indexOf('date created') > -1) && lc.some(x => x.indexOf('payout amount') > -1)) {
+      cols = { created:lc.findIndex(x => x.indexOf('date created') > -1),
+               deposited:lc.findIndex(x => x.indexOf('date deposited') > -1),
+               amount:lc.findIndex(x => x.indexOf('payout amount') > -1),
+               status:lc.findIndex(x => x.indexOf('status') > -1) };
+      return;
+    }
+    if (!cols) return;
+    const created = parseDateAny(row[cols.created]);
+    const amount = parseMoneyAny(row[cols.amount]);
+    if (!created || isNaN(amount)) return;
+    const L = (loc || '').toLowerCase().indexOf('markham') > -1 ? 'Markham'
+            : (loc || '').toLowerCase().indexOf('mississauga') > -1 ? 'Mississauga' : (loc || 'Shared');
+    rows.push({ id:L + '|' + created, location:L, created,
+      deposited:cols.deposited > -1 ? (parseDateAny(row[cols.deposited]) || '') : '',
+      amount:round2(amount), status:cols.status > -1 ? String(row[cols.status] || '').trim() : '' });
+  });
+  return rows.length ? { rows } : null;
+}
+const PAYOUT_KEY = 'rvbk_payouts_v1';
+function loadPayouts() { return lsGet(PAYOUT_KEY, { items:{}, updatedAt:'' }); }
+function applyPayouts(store, rows) {
+  const items = { ...(store.items || {}) };
+  let added = 0, updated = 0;
+  rows.forEach(r => {
+    if (!items[r.id]) added++;
+    else if (Math.abs(items[r.id].amount - r.amount) > 0.005 || items[r.id].status !== r.status) updated++;
+    items[r.id] = r;
+  });
+  const next = { items, updatedAt:new Date().toISOString() };
+  lsSet(PAYOUT_KEY, next);
+  return { store:next, added, updated, total:round2(rows.reduce((s,r) => s + r.amount, 0)) };
+}
+function payoutToRow(x, email) {
+  return { id:x.id, location:x.location || '', created:x.created || null, deposited:x.deposited || null,
+    amount:x.amount || 0, status:x.status || '', updated_at:new Date().toISOString(), updated_by:email || null };
+}
+function payoutFromRow(r) {
+  return { id:r.id, location:r.location || '', created:r.created || '', deposited:r.deposited || '',
+    amount:parseFloat(r.amount) || 0, status:r.status || '' };
+}
+/* monthly totals by the month the money LANDED in the bank */
+function payoutsByMonth(store) {
+  const m = {};
+  Object.values((store && store.items) || {}).forEach(x => {
+    const k = ym(x.deposited || x.created);
+    if (!k) return;
+    m[k] = round2((m[k] || 0) + (x.amount || 0));
+  });
+  return m;
+}
 const AR_KEY = 'rvbk_ar_v1';
 function loadAR() { return lsGet(AR_KEY, { invoices:{}, updatedAt:'' }); }
 function applySalesToAR(store, salesRows, fileName) {
@@ -1448,6 +1513,12 @@ function ImportPanel(p) {
       let aoa;
       if (isXlsx) aoa = await readXlsxRows(buf);
       else aoa = Papa.parse(new TextDecoder().decode(buf), { skipEmptyLines:true }).data;
+      const payouts = parseJanePayouts(aoa);
+      if (payouts) {
+        setPreview({ kind:'payouts', payouts, fileName:f.name, issues:[],
+          rows:payouts.rows.slice().sort((a,b) => (b.created || '').localeCompare(a.created || '')) });
+        return;
+      }
       const sales = parseJaneSales(aoa);
       if (sales) {
         setPreview({ kind:'sales', sales, fileName:f.name, issues:[],
@@ -1509,6 +1580,11 @@ function ImportPanel(p) {
   });
   const toggleRow = i => setPreview(pv => { const rows = pv.rows.slice(); rows[i] = { ...rows[i], include:!rows[i].include }; return { ...pv, rows }; });
   const doImport = () => {
+    if (preview.kind === 'payouts') {
+      p.onUpdatePayouts(preview.payouts.rows);
+      setPreview(null);
+      return;
+    }
     if (preview.kind === 'sales') {
       p.onUpdateAR(preview.sales.rows, preview.fileName);
       setPreview(null);
@@ -1555,10 +1631,32 @@ function ImportPanel(p) {
         h('span', { style:{ flex:1 } }),
         h('button', { className:'ghost', onClick:() => setPreview(null) }, 'Cancel'),
         h('button', { className:'ghost primary', onClick:doImport },
-          preview.kind === 'sales'
+          preview.kind === 'payouts'
+            ? 'Import ' + preview.rows.length + ' payouts · ' + money(round2(preview.rows.reduce((s,r) => s + r.amount, 0)))
+            : preview.kind === 'sales'
             ? 'Update A/R — ' + preview.rows.length + ' open · ' + money(preview.sales.totals.balance)
             : 'Import ' + nInc + ' selected' + (preview.kind === 'monthly' ? ' · ' + money(round2(preview.rows.filter(r => r.include).reduce((s,r) => s + r.t.amount, 0))) : ''))),
-      preview.kind === 'sales'
+      preview.kind === 'payouts'
+      ? h('div', null,
+        h('div', { style:{ display:'flex', gap:14, flexWrap:'wrap', marginBottom:10, fontSize:12.5 } },
+          h('span', null, h('b', null, preview.rows.length), h('span', { className:'dim' }, ' payouts')),
+          ['Mississauga','Markham'].map(L => {
+            const s = round2(preview.rows.filter(r => r.location === L).reduce((a,r) => a + r.amount, 0));
+            return s ? h('span', { key:L }, h('b', null, money(s)), h('span', { className:'dim' }, ' ' + L)) : null;
+          }),
+          h('span', null, h('b', { className:'v-teal' }, money(round2(preview.rows.reduce((s,r) => s + r.amount, 0)))), h('span', { className:'dim' }, ' total to the bank'))),
+        h('div', { style:{ maxHeight:400, overflow:'auto', border:'1px solid var(--line)', borderRadius:9 } },
+          h('table', null,
+            h('thead', null, h('tr', null,
+              h('th', null, 'Location'), h('th', null, 'Created'), h('th', null, 'Deposited'),
+              h('th', null, 'Status'), h('th', { className:'r' }, 'Amount'))),
+            h('tbody', null, preview.rows.map((r,i) => h('tr', { key:i },
+              h('td', null, r.location),
+              h('td', { className:'tnum dim' }, r.created),
+              h('td', { className:'tnum' }, r.deposited || '—'),
+              h('td', null, h('span', { className:'badge ' + (r.status === 'paid' ? 'b-green' : 'b-amber') }, r.status || '—')),
+              h('td', { className:'r tnum', style:{ fontWeight:600 } }, money(r.amount))))))))
+      : preview.kind === 'sales'
       ? h('div', null,
         h('div', { style:{ display:'flex', gap:14, flexWrap:'wrap', marginBottom:10, fontSize:12.5 } },
           h('span', null, h('b', null, preview.sales.totals.n), h('span', { className:'dim' }, ' invoice lines')),
@@ -1630,7 +1728,9 @@ function ImportPanel(p) {
             h('td', { className:'r tnum', style:{ color:r.t.kind === 'income' ? 'var(--green)' : 'var(--ink)' } },
               (r.t.kind === 'income' ? '+' : '−') + money(r.t.amount).replace('$','$'))))))),
       h('div', { className:'dim', style:{ fontSize:11.5, marginTop:8, lineHeight:1.5 } },
-        preview.kind === 'sales'
+        preview.kind === 'payouts'
+          ? 'Payouts feed the Revenue tab’s “Jane paid out” column — what Jane actually sent to the bank, by the month it was deposited. Re-uploading refreshes matching payouts; it never creates income or expense entries. AMEX settles inside these location payouts, so the column compares directly against expected-into-bank.'
+          : preview.kind === 'sales'
           ? 'A Sales report updates the accounts-receivable book (Revenue tab): invoices with a balance are tracked as owing, and any previously-tracked invoice this report now shows as paid clears automatically. Upload the latest Sales export any time to refresh who owes what — it never creates income or expense entries.'
           : preview.kind === 'daily'
           ? 'The Daily Transaction Report books the full picture per month: card revenue via Jane Payments (per location — the unlocated AMEX account is counted with Mississauga), insurer/direct-billing revenue, cash/cheque/e-transfer, and processing fees. Re-importing an updated report later simply refreshes those months. HST collected varies by service mix, so it isn’t auto-split on revenue lines — your accountant can compute it from Jane’s tax report, or set it per line.'
@@ -1692,7 +1792,8 @@ function LedgerTab(p) {
       h('button', { className:'ghost' + (showImport ? ' primary' : ''), onClick:() => setShowImport(v => !v), style:{ padding:'8px 14px' } }, showImport ? 'Hide import' : '⬆ Import CSV'),
       h('button', { className:'ghost primary', onClick:() => setAdding(v => !v), style:{ padding:'8px 14px' } }, adding ? 'Close' : '+ Add entry')),
     showImport ? h(ImportPanel, { txns:p.txns, accounts:p.accounts, onImport:rows => { p.onSave(rows); setShowImport(false); },
-      onUpdateAR:(rows, fn) => { p.onUpdateAR(rows, fn); setShowImport(false); } }) : null,
+      onUpdateAR:(rows, fn) => { p.onUpdateAR(rows, fn); setShowImport(false); },
+      onUpdatePayouts:rows => { p.onUpdatePayouts(rows); setShowImport(false); } }) : null,
     adding ? h('div', { className:'card', style:{ marginBottom:14, border:'1px solid var(--teal)' } },
       h('div', { className:'eyebrow', style:{ marginBottom:10 } }, 'New entry'),
       h(TxForm, { value:draft, onChange:setDraft, accounts:p.accounts }),
@@ -1800,10 +1901,11 @@ function RevenueTab(p) {
     });
     return m;
   }, [txns]);
+  const pobm = useMemo(() => payoutsByMonth(p.payouts), [p.payouts]);
   const months = useMemo(() => {
-    const s = new Set(Object.keys(rbm).concat(Object.keys(jbm)).concat(Object.keys(depositsByMonth)));
+    const s = new Set(Object.keys(rbm).concat(Object.keys(jbm)).concat(Object.keys(depositsByMonth)).concat(Object.keys(pobm)));
     return Array.from(s).sort().reverse().slice(0, 14);
-  }, [rbm, jbm, depositsByMonth]);
+  }, [rbm, jbm, depositsByMonth, pobm]);
   const nowMonth = ym(todayIso());
   const year = todayIso().slice(0,4);
   const revThis = (rbm[nowMonth] && rbm[nowMonth].collected) || 0;
@@ -1838,22 +1940,27 @@ function RevenueTab(p) {
             h('th', { className:'r' }, 'Through Jane Payments'),
             h('th', { className:'r' }, 'Jane fees'),
             h('th', { className:'r' }, 'Expected into bank'),
+            h('th', { className:'r', title:'From the Jane Payouts Report, by the month the money was deposited' }, 'Jane paid out'),
             h('th', { className:'r' }, 'Deposits recorded'),
             h('th', { className:'r' }, 'Difference'))),
           h('tbody', null,
             !months.length ? h('tr', null, h('td', { colSpan:7, className:'dim', style:{ padding:16, textAlign:'center' } },
               'Nothing to show yet — sync your pay runs and import a Jane monthly fee report.')) : null,
             months.map(k => {
-              const r = rbm[k], j = jbm[k], dep = depositsByMonth[k];
+              const r = rbm[k], j = jbm[k], dep = depositsByMonth[k], po = pobm[k];
               const basis = j && j.gross ? j.gross : (r ? r.collected : 0);
               const expected = (j && (j.gross || j.fees)) || r ? round2(basis - ((j && j.fees) || 0)) : null;
-              const diff = expected != null && dep != null ? round2(dep - expected) : null;
+              // reconcile the bank against what Jane says it sent when we have
+              // it (exact), otherwise against the expected figure (approximate)
+              const target = po != null ? po : expected;
+              const diff = target != null && dep != null ? round2(dep - target) : null;
               return h('tr', { key:k, style:k === nowMonth ? { background:'var(--surface-2)' } : null },
                 h('td', { style:{ fontWeight:600, whiteSpace:'nowrap' } }, ymLabel(k)),
                 cell(r ? r.collected : null),
                 cell(j && j.gross ? j.gross : null),
                 h('td', { className:'r tnum', style:{ color:'var(--coral)' } }, j && j.fees ? '−' + money(j.fees) : h('span', { className:'dim' }, '—')),
                 cell(expected, { style:{ fontWeight:700 } }),
+                cell(po != null ? po : null, { style:{ fontWeight:700, color:'var(--teal-ink)' } }),
                 cell(dep != null ? dep : null),
                 diff == null ? h('td', { className:'r dim' }, '—')
                   : h('td', { className:'r tnum', style:{ fontWeight:600, color:Math.abs(diff) < 25 ? 'var(--green)' : 'var(--amber)' } },
@@ -1863,7 +1970,7 @@ function RevenueTab(p) {
       h('div', { className:'dim', style:{ fontSize:11.5, marginTop:10, lineHeight:1.6 } },
         h('b', null, 'How to read this: '),
         '“Revenue collected” prefers your imported Jane Daily Transaction Reports (all payment methods); months without one fall back to the Jane reports inside your saved pay runs (deduped by invoice). ',
-        '“Through Jane Payments” is the card-processed slice from your monthly Jane fee report; that minus fees is what Jane actually pays out to the bank. ',
+        '“Expected into bank” is card revenue minus processing fees; “Jane paid out” is the exact figure from the Payouts Report, by deposit month (the last day or two of a month usually lands in the next one — normal). The Difference compares recorded bank deposits against Jane’s actual payouts when uploaded, otherwise against the expected figure. ',
         'Import your bank statement and the deposits column fills in — a green ✓ means Jane’s payouts landed as expected; an amber gap means deposits are missing, still in transit, or some card revenue didn’t come through Jane. ',
         'Months where a payment method column shows “—” just need that source imported.')));
 }
@@ -2275,6 +2382,13 @@ function App() {
   const [ledger, setLedger] = useState([]);
   const [revLines, setRevLines] = useState(() => lsGet('rvbk_rev_v1', []));
   const [ar, setAr] = useState(loadAR);
+  const [payouts, setPayouts] = useState(loadPayouts);
+  const updatePayouts = rows => {
+    const res = applyPayouts(payouts, rows);
+    setPayouts(res.store);
+    setMsg('Payouts updated — ' + rows.length + ' payouts · ' + money(res.total) + (res.updated ? ' · ' + res.updated + ' refreshed' : ''));
+    cloudWrite('bk_payouts', rows.map(x => payoutToRow(x, user)));
+  };
   const updateAR = (salesRows, fileName) => {
     const res = applySalesToAR(ar, salesRows, fileName);
     setAr(res.store);
@@ -2377,6 +2491,19 @@ function App() {
         setAr(nextAr); lsSet(AR_KEY, nextAr);
       } catch (e2) {
         // table not created yet → A/R stays browser-local; anything else is non-fatal too
+      }
+      try {
+        const poRows = await supaSelect(t, 'bk_payouts', 'select=*');
+        const server = {};
+        poRows.forEach(r => { server[r.id] = payoutFromRow(r); });
+        const localOnly = Object.values(payouts.items || {}).filter(x => !server[x.id]);
+        if (localOnly.length) await supaUpsert(t, 'bk_payouts', localOnly.map(x => payoutToRow(x, user)));
+        const merged = { ...server };
+        localOnly.forEach(x => { merged[x.id] = x; });
+        const nextPo = { items:merged, updatedAt:new Date().toISOString() };
+        setPayouts(nextPo); lsSet(PAYOUT_KEY, nextPo);
+      } catch (e3) {
+        // bk_payouts not created yet → payouts stay browser-local
       }
       // merge: server + local-only rows (pushed up)
       const srvTx = txRows.map(txFromRow);
@@ -2531,8 +2658,8 @@ function App() {
     h('div', { className:'tabs no-print' }, TABS.map(([id, label]) =>
       h('button', { key:id, className:'tab' + (tab === id ? ' on' : ''), onClick:() => setTab(id) }, label))),
     tab === 'overview' ? h(OverviewTab, { txns, accounts, recs, ledger, settings }) : null,
-    tab === 'ledger' ? h(LedgerTab, { txns, accounts, onSave:saveTxns, onDelete:deleteTx, onUpdateAR:updateAR }) : null,
-    tab === 'revenue' ? h(RevenueTab, { revLines, txns, signedIn:!!token, ar }) : null,
+    tab === 'ledger' ? h(LedgerTab, { txns, accounts, onSave:saveTxns, onDelete:deleteTx, onUpdateAR:updateAR, onUpdatePayouts:updatePayouts }) : null,
+    tab === 'revenue' ? h(RevenueTab, { revLines, txns, signedIn:!!token, ar, payouts }) : null,
     tab === 'payroll' ? h(PayrollTab, { ledger, settings, signedIn:!!token }) : null,
     tab === 'accountant' ? h(AccountantTab, { txns, ledger, settings, accounts }) : null,
     tab === 'budget' ? h(BudgetTab, { txns, buds, ledger, settings, onSetBudget:setBudget }) : null,
@@ -2541,7 +2668,7 @@ function App() {
       h('span', { style:{ display:'block', marginTop:6, fontWeight:600, color:'var(--pine)' } }, 'build ' + window.__BUILD)));
 }
 /* pure functions exposed for automated smoke-testing; harmless in production */
-window.__BK = { parseDateAny, parseMoneyAny, sniffBankColumns, normalizeBankCsv, normalizeJaneFees, autoCategory, rollup, hstIn, txHash, payrollByMonth, nextPayrollEstimate, upcomingRecurring, readXlsxRows, parseJaneMonthly, guessJaneYear, buildJaneMonthlyRows, monthEndIso, revenueLinesFromLedger, revenueByMonth, janeByMonth, parseJaneDaily, buildJaneDailyRows, parseJaneSales, applySalesToAR, arAgeBucket, loadAR };
+window.__BK = { parseDateAny, parseMoneyAny, sniffBankColumns, normalizeBankCsv, normalizeJaneFees, autoCategory, rollup, hstIn, txHash, payrollByMonth, nextPayrollEstimate, upcomingRecurring, readXlsxRows, parseJaneMonthly, guessJaneYear, buildJaneMonthlyRows, monthEndIso, revenueLinesFromLedger, revenueByMonth, janeByMonth, parseJaneDaily, buildJaneDailyRows, parseJaneSales, applySalesToAR, arAgeBucket, loadAR, parseJanePayouts, applyPayouts, payoutsByMonth };
 ReactDOM.createRoot(document.getElementById('root')).render(h(App));
   }catch(e){ showError((e&&(e.message||String(e)))||'Unknown error'); if(window.console) console.error(e); }
 })();
