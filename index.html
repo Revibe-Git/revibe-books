@@ -443,7 +443,7 @@ License: MIT
   try{
     if(typeof React==='undefined'||typeof ReactDOM==='undefined') return showError('React failed to initialize.');
     if(typeof Papa==='undefined') return showError('PapaParse failed to initialize.');
-    window.__BUILD='B11';
+    window.__BUILD='B12';
 const h = React.createElement;
 const { useState, useMemo, useRef, useEffect, useCallback } = React;
 /* ---------- formatting ---------- */
@@ -505,6 +505,7 @@ const AUTO_RULES = [
   { rx:/enbridge|alectra|hydro|reliance|water|gas bill|energ/i, expense:'utilities' },
   { rx:/rogers|bell|telus|internet|fido/i, expense:'utilities' },
   { rx:/amazon|amzn|costco|staples|uline|medsup|supply|supplies|clinical|rehab ?depot|fitness ?depot/i, expense:'supplies' },
+  { rx:/sunlife|sun life|provider ?connect|telus|eclaims|manulife|canada ?life|desjardins|equitable life|wsib|greenshield|green shield|claimsecure|industrial alliance|grouphealth/i, income:'insurer_rev' },
   { rx:/insur|wsib premium|intact|aviva/i, expense:'insurance' },
   { rx:/google|meta|facebook|instagram|canva|mailchimp|gohighlevel|ghl|highlevel|openai|anthropic|vercel|supabase|adobe|zoom|slack/i, expense:'software' },
   { rx:/interest|\bnsf\b|service charge|monthly fee|acct fee|account fee|overdraft/i, expense:'bank_fees' },
@@ -961,6 +962,11 @@ function parseJaneDaily(aoa) {
     agg[key].sum = round2(agg[key].sum + amt);
     agg[key].n += n || 0;
   };
+  // per-insurer claim detail: TELUS eClaims adjudicates in near-real-time, but
+  // direct-billing submissions (Sunlife, ProviderConnect, WSIB…) are
+  // submit-and-wait — the reimbursement arrives whenever the insurer pays
+  const claims = {}; // 'YYYY-MM' -> { insurerName: { amount, n, wait } }
+  const isWaitInsurer = lm => lm.indexOf('direct billing') > -1 || lm.indexOf('providerconnect') > -1 || lm === 'wsib';
   let any = false;
   aoa.slice(hi + 1).forEach(row => {
     if (!row) return;
@@ -979,9 +985,22 @@ function parseJaneDaily(aoa) {
       bump(k + '|cash|', amt, n);
     } else {
       bump(k + '|insurer|', amt, n);
+      claims[k] = claims[k] || {};
+      claims[k][method] = claims[k][method] || { amount:0, n:0, wait:isWaitInsurer(lm) };
+      claims[k][method].amount = round2(claims[k][method].amount + amt);
+      claims[k][method].n += n;
     }
   });
-  return any ? { agg } : null;
+  return any ? { agg, claims } : null;
+}
+const CLAIMS_KEY = 'rvbk_claims_v1';
+function loadClaims() { return lsGet(CLAIMS_KEY, { months:{}, updatedAt:'' }); }
+function applyClaims(store, claims) {
+  const months = { ...(store.months || {}) };
+  Object.keys(claims || {}).forEach(k => { months[k] = claims[k]; }); // re-import replaces the month
+  const next = { months, updatedAt:new Date().toISOString() };
+  lsSet(CLAIMS_KEY, next);
+  return next;
 }
 const DAILY_BUCKETS = {
   card:    { category:'jane_deposits', kind:'income',  label:'Card revenue via Jane Payments' },
@@ -1210,7 +1229,8 @@ function rollup(txns, opts) {
     if (o.skipCat && o.skipCat[t.category]) return;
     // when revenue is booked from Jane reports, bank deposit lines are the same
     // money arriving — keep them for balances & reconciliation, not the P&L
-    if (o.skipBankJaneDeposits && t.source === 'bank' && t.kind === 'income' && t.category === 'jane_deposits') return;
+    if (o.skipBankJaneDeposits && t.source === 'bank' && t.kind === 'income' &&
+        (t.category === 'jane_deposits' || t.category === 'insurer_rev' || t.category === 'cash_rev')) return;
     if (!inPL(t)) {
       // still track HST remitted etc. elsewhere; skip for P&L
       return;
@@ -1527,7 +1547,7 @@ function ImportPanel(p) {
       }
       const daily = parseJaneDaily(aoa);
       if (daily) {
-        setPreview({ kind:'daily', fileName:f.name, issues:[],
+        setPreview({ kind:'daily', fileName:f.name, issues:[], claims:daily.claims,
           rows:buildJaneDailyRows(daily, defAcc, p.txns) });
         return;
       }
@@ -1593,6 +1613,7 @@ function ImportPanel(p) {
     const take = preview.rows.filter(r => r.include).map(r => ({ ...r.t, location:r.t.location || defLoc, account_id:r.t.account_id || defAcc }));
     if (!take.length) { window.alert('Nothing selected to import.'); return; }
     p.onImport(take);
+    if (preview.kind === 'daily' && preview.claims && p.onSaveClaims) p.onSaveClaims(preview.claims);
     setPreview(null);
   };
   const nInc = preview ? preview.rows.filter(r => r.include).length : 0;
@@ -1793,7 +1814,8 @@ function LedgerTab(p) {
       h('button', { className:'ghost primary', onClick:() => setAdding(v => !v), style:{ padding:'8px 14px' } }, adding ? 'Close' : '+ Add entry')),
     showImport ? h(ImportPanel, { txns:p.txns, accounts:p.accounts, onImport:rows => { p.onSave(rows); setShowImport(false); },
       onUpdateAR:(rows, fn) => { p.onUpdateAR(rows, fn); setShowImport(false); },
-      onUpdatePayouts:rows => { p.onUpdatePayouts(rows); setShowImport(false); } }) : null,
+      onUpdatePayouts:rows => { p.onUpdatePayouts(rows); setShowImport(false); },
+      onSaveClaims:p.onSaveClaims }) : null,
     adding ? h('div', { className:'card', style:{ marginBottom:14, border:'1px solid var(--teal)' } },
       h('div', { className:'eyebrow', style:{ marginBottom:10 } }, 'New entry'),
       h(TxForm, { value:draft, onChange:setDraft, accounts:p.accounts }),
@@ -1966,6 +1988,7 @@ function RevenueTab(p) {
                   : h('td', { className:'r tnum', style:{ fontWeight:600, color:Math.abs(diff) < 25 ? 'var(--green)' : 'var(--amber)' } },
                       (diff >= 0 ? '+' : '−') + money(Math.abs(diff)),
                       Math.abs(diff) < 25 ? ' ✓' : '')); })))),
+      h(InsurerClaimsSection, { claims:p.claims, txns:p.txns }),
       h(ARSection, { ar:p.ar }),
       h('div', { className:'dim', style:{ fontSize:11.5, marginTop:10, lineHeight:1.6 } },
         h('b', null, 'How to read this: '),
@@ -2006,6 +2029,62 @@ function exportFollowUp(invList) {
   a.href = URL.createObjectURL(new Blob(['\ufeff' + out.join('\r\n')], { type:'text/csv;charset=utf-8' }));
   a.download = 'Revibe_FollowUp_List_' + todayIso() + '.csv';
   a.click();
+}
+/* insurer money submitted through Jane — real-time vs submit-and-wait.
+   Sunlife direct billing, ProviderConnect and WSIB pay whenever they pay;
+   this tracks how much of each month is still floating with them. */
+function InsurerClaimsSection(p) {
+  const monthsData = (p.claims && p.claims.months) || {};
+  const monthKeys = Object.keys(monthsData).sort().reverse().slice(0, 6);
+  const [open, setOpen] = useState(null);
+  if (!monthKeys.length) return null;
+  // insurer reimbursements actually recorded from the bank, by month
+  const bankIns = {};
+  (p.txns || []).forEach(t => {
+    if (t.source !== 'bank' || t.kind !== 'income' || t.category !== 'insurer_rev') return;
+    const k = ym(t.date);
+    if (k) bankIns[k] = round2((bankIns[k] || 0) + (t.amount || 0));
+  });
+  return h('div', { style:{ marginTop:18 } },
+    h('div', { className:'sec-h' },
+      h('h3', null, 'Insurer money — submitted vs received'),
+      h('span', { className:'dim', style:{ fontSize:12 } }, 'TELUS eClaims settle in near-real-time; direct-billing claims (Sunlife, ProviderConnect, WSIB) pay when the insurer pays')),
+    h('div', { className:'card', style:{ padding:'6px 10px' } },
+      h('table', null,
+        h('thead', null, h('tr', null,
+          h('th', null, 'Month'),
+          h('th', { className:'r', title:'TELUS eClaims and other real-time adjudicated insurers' }, 'Real-time settled'),
+          h('th', { className:'r', title:'Sunlife / ProviderConnect / other direct billing / WSIB — submitted, awaiting the insurer' }, 'Submit-and-wait'),
+          h('th', { className:'r' }, 'Insurer deposits in bank'),
+          h('th', { className:'r' }, 'Still floating'), h('th', null, ''))),
+        h('tbody', null, monthKeys.map(k => {
+          const ins = monthsData[k];
+          const names = Object.keys(ins);
+          const rt = round2(names.filter(n => !ins[n].wait).reduce((s,n) => s + ins[n].amount, 0));
+          const wait = round2(names.filter(n => ins[n].wait).reduce((s,n) => s + ins[n].amount, 0));
+          const got = bankIns[k];
+          const floating = got != null ? round2(wait - got) : null;
+          const isOpen = open === k;
+          return [
+            h('tr', { key:k, style:{ cursor:'pointer' }, onClick:() => setOpen(isOpen ? null : k) },
+              h('td', { style:{ fontWeight:600, whiteSpace:'nowrap' } }, ymLabel(k)),
+              h('td', { className:'r tnum' }, money(rt)),
+              h('td', { className:'r tnum', style:{ fontWeight:700, color:'var(--amber)' } }, money(wait)),
+              h('td', { className:'r tnum' }, got != null ? money(got) : h('span', { className:'dim', title:'Import a bank statement — insurer reimbursements auto-categorize as “Insurer & direct billing revenue”' }, '—')),
+              h('td', { className:'r tnum', style:{ fontWeight:600, color:floating == null ? 'var(--ink-3)' : floating > 25 ? 'var(--red)' : 'var(--green)' } },
+                floating == null ? '—' : money(Math.max(0, floating)) + (floating <= 25 ? ' ✓' : '')),
+              h('td', { className:'dim', style:{ fontSize:11, whiteSpace:'nowrap' } }, isOpen ? '▾ hide' : '▸ detail')),
+            isOpen ? h('tr', { key:k + '_d' }, h('td', { colSpan:6, style:{ background:'var(--surface-2)', borderRadius:8 } },
+              h('div', { style:{ display:'grid', gridTemplateColumns:'repeat(auto-fill,minmax(290px,1fr))', gap:'4px 18px', padding:'8px 6px' } },
+                names.sort((a,b) => ins[b].amount - ins[a].amount).map(n => h('div', { key:n, style:{ display:'flex', gap:8, fontSize:12 } },
+                  h('span', { className:ins[n].wait ? 'badge b-amber' : 'badge b-teal', style:{ flexShrink:0 } }, ins[n].wait ? 'wait' : 'live'),
+                  h('span', { style:{ flex:1, overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap' } }, n),
+                  h('span', { className:'dim' }, ins[n].n + '×'),
+                  h('span', { className:'tnum', style:{ fontWeight:600 } }, money(ins[n].amount))))))) : null
+          ];
+        }))),
+      h('div', { className:'dim', style:{ fontSize:11.5, padding:'8px 4px 4px', lineHeight:1.55 } },
+        '“Still floating” = submit-and-wait claims minus insurer reimbursements recorded from the bank. It’s approximate — insurers batch and lag across month ends — but a number that stays red for weeks is money to chase. Claims data refreshes each time you import a Daily Transaction Report.')));
 }
 /* accounts receivable — who owes what, from the latest Sales report upload */
 function ARSection(p) {
@@ -2383,6 +2462,8 @@ function App() {
   const [revLines, setRevLines] = useState(() => lsGet('rvbk_rev_v1', []));
   const [ar, setAr] = useState(loadAR);
   const [payouts, setPayouts] = useState(loadPayouts);
+  const [claims, setClaims] = useState(loadClaims);
+  const saveClaims = c => { setClaims(applyClaims(claims, c)); };
   const updatePayouts = rows => {
     const res = applyPayouts(payouts, rows);
     setPayouts(res.store);
@@ -2658,8 +2739,8 @@ function App() {
     h('div', { className:'tabs no-print' }, TABS.map(([id, label]) =>
       h('button', { key:id, className:'tab' + (tab === id ? ' on' : ''), onClick:() => setTab(id) }, label))),
     tab === 'overview' ? h(OverviewTab, { txns, accounts, recs, ledger, settings }) : null,
-    tab === 'ledger' ? h(LedgerTab, { txns, accounts, onSave:saveTxns, onDelete:deleteTx, onUpdateAR:updateAR, onUpdatePayouts:updatePayouts }) : null,
-    tab === 'revenue' ? h(RevenueTab, { revLines, txns, signedIn:!!token, ar, payouts }) : null,
+    tab === 'ledger' ? h(LedgerTab, { txns, accounts, onSave:saveTxns, onDelete:deleteTx, onUpdateAR:updateAR, onUpdatePayouts:updatePayouts, onSaveClaims:saveClaims }) : null,
+    tab === 'revenue' ? h(RevenueTab, { revLines, txns, signedIn:!!token, ar, payouts, claims }) : null,
     tab === 'payroll' ? h(PayrollTab, { ledger, settings, signedIn:!!token }) : null,
     tab === 'accountant' ? h(AccountantTab, { txns, ledger, settings, accounts }) : null,
     tab === 'budget' ? h(BudgetTab, { txns, buds, ledger, settings, onSetBudget:setBudget }) : null,
@@ -2668,7 +2749,7 @@ function App() {
       h('span', { style:{ display:'block', marginTop:6, fontWeight:600, color:'var(--pine)' } }, 'build ' + window.__BUILD)));
 }
 /* pure functions exposed for automated smoke-testing; harmless in production */
-window.__BK = { parseDateAny, parseMoneyAny, sniffBankColumns, normalizeBankCsv, normalizeJaneFees, autoCategory, rollup, hstIn, txHash, payrollByMonth, nextPayrollEstimate, upcomingRecurring, readXlsxRows, parseJaneMonthly, guessJaneYear, buildJaneMonthlyRows, monthEndIso, revenueLinesFromLedger, revenueByMonth, janeByMonth, parseJaneDaily, buildJaneDailyRows, parseJaneSales, applySalesToAR, arAgeBucket, loadAR, parseJanePayouts, applyPayouts, payoutsByMonth };
+window.__BK = { parseDateAny, parseMoneyAny, sniffBankColumns, normalizeBankCsv, normalizeJaneFees, autoCategory, rollup, hstIn, txHash, payrollByMonth, nextPayrollEstimate, upcomingRecurring, readXlsxRows, parseJaneMonthly, guessJaneYear, buildJaneMonthlyRows, monthEndIso, revenueLinesFromLedger, revenueByMonth, janeByMonth, parseJaneDaily, buildJaneDailyRows, parseJaneSales, applySalesToAR, arAgeBucket, loadAR, parseJanePayouts, applyPayouts, payoutsByMonth, applyClaims, loadClaims };
 ReactDOM.createRoot(document.getElementById('root')).render(h(App));
   }catch(e){ showError((e&&(e.message||String(e)))||'Unknown error'); if(window.console) console.error(e); }
 })();
