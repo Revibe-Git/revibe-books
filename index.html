@@ -443,7 +443,7 @@ License: MIT
   try{
     if(typeof React==='undefined'||typeof ReactDOM==='undefined') return showError('React failed to initialize.');
     if(typeof Papa==='undefined') return showError('PapaParse failed to initialize.');
-    window.__BUILD='B7';
+    window.__BUILD='B8';
 const h = React.createElement;
 const { useState, useMemo, useRef, useEffect, useCallback } = React;
 /* ---------- formatting ---------- */
@@ -571,6 +571,18 @@ async function supaUpsert(token, table, rows) {
     const d = await r.json().catch(() => ({}));
     if (r.status === 401) throw new Error('401 Session expired');
     throw new Error((d.message || d.hint || (table + ' save failed')) + ' (' + r.status + ')');
+  }
+}
+async function supaDeleteIn(token, table, col, ids) {
+  for (let i = 0; i < ids.length; i += 80) {
+    const chunk = ids.slice(i, i + 80).map(x => '"' + String(x).replace(/"/g, '') + '"').join(',');
+    const r = await fetch(supaBase() + '/rest/v1/' + table + '?' + col + '=in.(' + encodeURIComponent(chunk) + ')', {
+      method:'DELETE', headers:{ apikey:SUPA.key, Authorization:'Bearer ' + token }
+    });
+    if (!r.ok) {
+      const d = await r.json().catch(() => ({}));
+      throw new Error(d.message || 'Delete failed');
+    }
   }
 }
 async function supaDelete(token, table, id) {
@@ -1062,18 +1074,31 @@ function loadAR() { return lsGet(AR_KEY, { invoices:{}, updatedAt:'' }); }
 function applySalesToAR(store, salesRows, fileName) {
   const inv = { ...(store.invoices || {}) };
   let added = 0, updated = 0, cleared = 0;
+  const touched = [], clearedIds = [];
   salesRows.forEach(r => {
     if (r.balance > 0.005) {
       if (!inv[r.invoice]) added++;
       else if (Math.abs(inv[r.invoice].balance - r.balance) > 0.005) updated++;
       inv[r.invoice] = { invoice:r.invoice, date:r.date, patient:r.patient, item:r.item, payer:r.payer,
         status:r.status, location:r.location, total:r.total, balance:r.balance, seen:todayIso() };
-    } else if (inv[r.invoice]) { delete inv[r.invoice]; cleared++; }
+      touched.push(inv[r.invoice]);
+    } else if (inv[r.invoice]) { delete inv[r.invoice]; cleared++; clearedIds.push(r.invoice); }
   });
   const next = { invoices:inv, updatedAt:new Date().toISOString(), lastFile:fileName || '' };
   lsSet(AR_KEY, next);
-  return { store:next, added, updated, cleared,
+  return { store:next, added, updated, cleared, touched, clearedIds,
     totalAR:round2(Object.values(inv).reduce((s,x) => s + x.balance, 0)), openN:Object.keys(inv).length };
+}
+function arToRow(x, email) {
+  return { invoice:x.invoice, date:x.date || null, patient:x.patient || '', item:x.item || '',
+    payer:x.payer || '', status:x.status || '', location:x.location || '',
+    total:x.total || 0, balance:x.balance || 0, seen:x.seen || null,
+    updated_at:new Date().toISOString(), updated_by:email || null };
+}
+function arFromRow(r) {
+  return { invoice:r.invoice, date:r.date || '', patient:r.patient || '', item:r.item || '',
+    payer:r.payer || '', status:r.status || '', location:r.location || '',
+    total:parseFloat(r.total) || 0, balance:parseFloat(r.balance) || 0, seen:r.seen || '' };
 }
 function arAgeBucket(dateIso) {
   if (!dateIso) return '0–30 days';
@@ -1841,6 +1866,39 @@ function RevenueTab(p) {
         'Import your bank statement and the deposits column fills in — a green ✓ means Jane’s payouts landed as expected; an amber gap means deposits are missing, still in transit, or some card revenue didn’t come through Jane. ',
         'Months where a payment method column shows “—” just need that source imported.')));
 }
+/* front-desk follow-up list: one row per patient to work down, then detail */
+function exportFollowUp(invList) {
+  const q = c => '"' + String(c == null ? '' : c).replace(/"/g, '""') + '"';
+  const n2 = x => (Math.round((x || 0) * 100) / 100).toFixed(2);
+  const line = arr => arr.map(q).join(',');
+  const days = d => d ? Math.floor((Date.parse(todayIso() + 'T12:00:00') - Date.parse(d + 'T12:00:00')) / 86400000) : 0;
+  const by = {};
+  invList.forEach(x => {
+    const k = x.patient || '(no name)';
+    by[k] = by[k] || { patient:k, n:0, balance:0, oldest:'' };
+    by[k].n++; by[k].balance = round2(by[k].balance + x.balance);
+    if (!by[k].oldest || (x.date && x.date < by[k].oldest)) by[k].oldest = x.date;
+  });
+  const summary = Object.values(by).sort((a,b) => days(b.oldest) - days(a.oldest) || b.balance - a.balance);
+  const total = round2(invList.reduce((s,x) => s + x.balance, 0));
+  const out = [];
+  out.push(line(['Revibe — Patient Balance Follow-Up List']));
+  out.push(line(['Generated', todayIso()]));
+  out.push(line(['Total outstanding', n2(total), summary.length + ' patients', invList.length + ' invoices']));
+  out.push('');
+  out.push(line(['FOLLOW-UP ORDER — oldest first']));
+  out.push(line(['Patient', 'Owing', 'Open invoices', 'Oldest invoice', 'Days outstanding', 'Age bucket', 'Contacted (fill in)', 'Outcome (fill in)']));
+  summary.forEach(s => out.push(line([s.patient, n2(s.balance), s.n, s.oldest, days(s.oldest), arAgeBucket(s.oldest), '', ''])));
+  out.push('');
+  out.push(line(['INVOICE DETAIL']));
+  out.push(line(['Patient', 'Invoice #', 'Date', 'Days', 'Item', 'Payer', 'Status', 'Location', 'Owing']));
+  invList.slice().sort((a,b) => (a.patient || '').localeCompare(b.patient || '') || (a.date || '').localeCompare(b.date || ''))
+    .forEach(x => out.push(line([x.patient, x.invoice, x.date, days(x.date), x.item, x.payer, x.status, x.location, n2(x.balance)])));
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob(['\ufeff' + out.join('\r\n')], { type:'text/csv;charset=utf-8' }));
+  a.download = 'Revibe_FollowUp_List_' + todayIso() + '.csv';
+  a.click();
+}
 /* accounts receivable — who owes what, from the latest Sales report upload */
 function ARSection(p) {
   const inv = Object.values((p.ar && p.ar.invoices) || {});
@@ -1869,6 +1927,9 @@ function ARSection(p) {
       h('h3', null, 'Accounts receivable'),
       h('span', { className:'dim', style:{ fontSize:12 } },
         inv.length ? inv.length + ' open invoices · updated ' + ((p.ar.updatedAt || '').slice(0,10) || '—') : 'upload a Jane Sales report to track who owes you')),
+    inv.length ? h('div', { style:{ margin:'-4px 0 10px' } },
+      h('button', { className:'ghost primary', style:{ padding:'6px 14px', fontSize:12 }, onClick:() => exportFollowUp(inv) },
+        '⬇ Follow-up list for front desk (CSV)')) : null,
     !inv.length
       ? h('div', { className:'card', style:{ padding:18 } },
           h('span', { className:'dim', style:{ fontSize:12.5 } }, 'Transactions → Import CSV → Jane fees report → drop a ', h('b', null, 'Sales export'), ' — open balances land here, and re-uploads clear whatever has since been paid.'))
@@ -2218,6 +2279,10 @@ function App() {
     setAr(res.store);
     setMsg('A/R updated — ' + res.openN + ' open invoices · ' + money(res.totalAR) + ' owing'
       + (res.cleared ? ' · ' + res.cleared + ' cleared as paid' : ''));
+    // mirror to the cloud so A/R follows you across machines
+    if (res.touched.length) cloudWrite('bk_ar', res.touched.map(x => arToRow(x, user)));
+    if (res.clearedIds.length && token) supaDeleteIn(token, 'bk_ar', 'invoice', res.clearedIds)
+      .catch(err => { if (!/does not exist|Could not find/i.test(err.message)) setMsg('A/R cloud cleanup failed: ' + err.message); });
   };
   const [token, setToken] = useState(() => lsGetStr(LS.tok));
   const [refreshTok, setRefreshTok] = useState(() => lsGetStr(LS.refresh));
@@ -2297,6 +2362,21 @@ function App() {
       ]);
       const rl = revenueLinesFromLedger(ledRows);
       setRevLines(rl); lsSet('rvbk_rev_v1', rl);
+      // A/R lives in its own table; fetched separately so an un-migrated
+      // database never blocks the main sync (run the latest setup SQL to enable)
+      try {
+        const arRows = await supaSelect(t, 'bk_ar', 'select=*');
+        const server = {};
+        arRows.forEach(r => { server[r.invoice] = arFromRow(r); });
+        const localOnly = Object.values(ar.invoices || {}).filter(x => !server[x.invoice]);
+        if (localOnly.length) await supaUpsert(t, 'bk_ar', localOnly.map(x => arToRow(x, user)));
+        const merged = { ...server };
+        localOnly.forEach(x => { merged[x.invoice] = x; });
+        const nextAr = { invoices:merged, updatedAt:new Date().toISOString(), lastFile:(ar && ar.lastFile) || '' };
+        setAr(nextAr); lsSet(AR_KEY, nextAr);
+      } catch (e2) {
+        // table not created yet → A/R stays browser-local; anything else is non-fatal too
+      }
       // merge: server + local-only rows (pushed up)
       const srvTx = txRows.map(txFromRow);
       const srvIds = new Set(srvTx.map(x => x.id));
