@@ -443,7 +443,7 @@ License: MIT
   try{
     if(typeof React==='undefined'||typeof ReactDOM==='undefined') return showError('React failed to initialize.');
     if(typeof Papa==='undefined') return showError('PapaParse failed to initialize.');
-    window.__BUILD='B4';
+    window.__BUILD='B5';
 const h = React.createElement;
 const { useState, useMemo, useRef, useEffect, useCallback } = React;
 /* ---------- formatting ---------- */
@@ -626,6 +626,57 @@ function budFromRow(r) {
 function ledgerFromRow(r) {
   return { id:r.id, from:r.period_from || '', to:r.period_to || '', cohortLabel:r.cohort_label || 'All',
     title:r.title || '', totals:r.totals || {}, nStaff:(r.lines || []).length, savedAt:r.saved_at || '' };
+}
+/* Revenue feed: each saved pay run snapshots the full Jane report it was built
+   from — every invoice line with what was collected. Aggregating those lines
+   (deduped by invoice #, since cohort runs and re-saves repeat the same report)
+   gives ongoing clinic revenue with no extra uploads. */
+function revenueLinesFromLedger(rawRows) {
+  const seen = {};
+  (rawRows || []).forEach(r => {
+    const rows = (r.snapshot && r.snapshot.rows) || [];
+    rows.forEach(row => {
+      const date = parseDateAny(row.purchaseDate || row.invoiceDate) || (r.period_to || '');
+      const inv = row.invoice || ((row.patient || '') + '|' + date + '|' + (row.item || ''));
+      const collected = parseFloat(row.collected) || 0;
+      const invoiced = parseFloat(row.total) || ((parseFloat(row.subtotal) || 0) + (parseFloat(row.hst) || 0));
+      const prev = seen[inv];
+      // the most recent snapshot of an invoice has the most collected on it
+      if (!prev || collected > prev.collected) seen[inv] = { date, collected:round2(collected), invoiced:round2(invoiced) };
+    });
+  });
+  return Object.values(seen);
+}
+function revenueByMonth(revLines) {
+  const m = {};
+  (revLines || []).forEach(x => {
+    const k = ym(x.date);
+    if (!k) return;
+    m[k] = m[k] || { collected:0, invoiced:0, n:0 };
+    m[k].collected = round2(m[k].collected + (x.collected || 0));
+    m[k].invoiced = round2(m[k].invoiced + (x.invoiced || 0));
+    m[k].n++;
+  });
+  return m;
+}
+/* per-month Jane Payments figures out of the imported fee transactions:
+   fees from the amounts; the card-processed gross is stored on each imported
+   line (ref "gross:…", with a description fallback for earlier imports) */
+function janeByMonth(txns) {
+  const m = {};
+  (txns || []).forEach(t => {
+    if (t.category !== 'jane_fees') return;
+    const k = ym(t.date);
+    if (!k) return;
+    m[k] = m[k] || { fees:0, gross:0 };
+    m[k].fees = round2(m[k].fees + (t.amount || 0));
+    let g = 0;
+    const mr = /gross:([\d.]+)/.exec(t.ref || '');
+    if (mr) g = parseFloat(mr[1]) || 0;
+    else { const md = /on \$([\d,]+(?:\.\d+)?)/.exec(t.description || ''); if (md) g = parseFloat(md[1].replace(/,/g, '')) || 0; }
+    m[k].gross = round2(m[k].gross + g);
+  });
+  return m;
 }
 /* ---------- local cache (offline copy; cloud is the source of truth) ---------- */
 const LS = {
@@ -892,7 +943,7 @@ function buildJaneMonthlyRows(monthly, year, defLoc, defAcc, existingHashes) {
       const t = { id:uid(), date:monthEndIso(year, mm.month),
         description:'Jane processing fees — ' + MONTHS[mm.month - 1] + ' ' + year + (mm.n ? ' (' + mm.n + ' transactions on ' + money(mm.gross) + ')' : ''),
         category:'jane_fees', kind:'expense', location:loc, amount:round2(mm.fees), hst:0,
-        account_id:defAcc, source:'jane' };
+        account_id:defAcc, source:'jane', ref:'gross:' + (mm.gross || 0) };
       t.hash = txHash(t);
       rows.push({ t, loc, month:mm.month, gross:mm.gross, n:mm.n,
         dupe:existingHashes.has(t.hash), include:!existingHashes.has(t.hash) && mm.fees > 0 });
@@ -1465,6 +1516,86 @@ function PayrollTab(p) {
             + ' · gross ' + money((e.totals && e.totals.gross) || 0) + ' · HST ' + money((e.totals && e.totals.hst) || 0))),
         h('div', { className:'ramt num' }, money((e.totals && e.totals.net) || 0)))))));
 }
+/* ===================== Revenue & bank reconciliation ===================== */
+function RevenueTab(p) {
+  const { revLines, txns, signedIn } = p;
+  const rbm = useMemo(() => revenueByMonth(revLines), [revLines]);
+  const jbm = useMemo(() => janeByMonth(txns), [txns]);
+  const depositsByMonth = useMemo(() => {
+    const m = {};
+    txns.forEach(t => {
+      if (t.category !== 'jane_deposits' || t.kind !== 'income') return;
+      const k = ym(t.date);
+      if (k) m[k] = round2((m[k] || 0) + (t.amount || 0));
+    });
+    return m;
+  }, [txns]);
+  const months = useMemo(() => {
+    const s = new Set(Object.keys(rbm).concat(Object.keys(jbm)).concat(Object.keys(depositsByMonth)));
+    return Array.from(s).sort().reverse().slice(0, 14);
+  }, [rbm, jbm, depositsByMonth]);
+  const nowMonth = ym(todayIso());
+  const year = todayIso().slice(0,4);
+  const revThis = (rbm[nowMonth] && rbm[nowMonth].collected) || 0;
+  const revYtd = round2(Object.keys(rbm).filter(k => k.slice(0,4) === year).reduce((s,k) => s + rbm[k].collected, 0));
+  const feesYtd = round2(Object.keys(jbm).filter(k => k.slice(0,4) === year).reduce((s,k) => s + jbm[k].fees, 0));
+  const expThis = (() => {
+    const j = jbm[nowMonth] || { fees:0, gross:0 };
+    const basis = j.gross || revThis;
+    return basis ? round2(basis - j.fees) : 0;
+  })();
+  const cell = (v, opts) => h('td', { className:'r tnum', style:(opts && opts.style) || null },
+    v == null ? h('span', { className:'dim' }, '—') : money(v));
+  return h('div', null,
+    h('div', { className:'metrics' },
+      h(Metric, { lab:'Revenue this month', val:money(revThis), cls:'v-green',
+        hint:rbm[nowMonth] ? (rbm[nowMonth].n + ' invoice lines · live from pay-run reports') : 'no pay-run data for this month yet' }),
+      h(Metric, { lab:'Revenue YTD (' + year + ')', val:money(revYtd), hint:'collected, all payment methods' }),
+      h(Metric, { lab:'Jane fees YTD', val:money(feesYtd), mcls:'m-coral', cls:'v-coral', hint:'from your monthly Jane fee imports' }),
+      h(Metric, { lab:'Expected into bank — this month', val:money(expThis), mcls:'m-green', cls:'v-teal',
+        hint:'card revenue through Jane − processing fees' })),
+    !revLines.length ? h('div', { className:'warnbox', style:{ marginBottom:14 } }, h('span', null, '⚠'),
+      h('span', null, signedIn
+        ? h('span', null, 'No revenue data yet. Revenue reads from the reports inside your ', h('b', null, 'saved pay runs'), ' on the payroll dashboard — save a run to the ledger there (runs saved before snapshots existed need a one-time re-save with the original files), then hit Sync now here.')
+        : h('span', null, 'Sign in (top right) and sync — revenue is read from the pay runs saved on the payroll dashboard.'))) : null,
+    h('div', { className:'card' },
+      h('div', { className:'eyebrow', style:{ marginBottom:8 } }, 'Revenue → Jane fees → bank, by month'),
+      h('div', { style:{ overflowX:'auto' } },
+        h('table', null,
+          h('thead', null, h('tr', null,
+            h('th', null, 'Month'),
+            h('th', { className:'r' }, 'Revenue collected'),
+            h('th', { className:'r' }, 'Through Jane Payments'),
+            h('th', { className:'r' }, 'Jane fees'),
+            h('th', { className:'r' }, 'Expected into bank'),
+            h('th', { className:'r' }, 'Deposits recorded'),
+            h('th', { className:'r' }, 'Difference'))),
+          h('tbody', null,
+            !months.length ? h('tr', null, h('td', { colSpan:7, className:'dim', style:{ padding:16, textAlign:'center' } },
+              'Nothing to show yet — sync your pay runs and import a Jane monthly fee report.')) : null,
+            months.map(k => {
+              const r = rbm[k], j = jbm[k], dep = depositsByMonth[k];
+              const basis = j && j.gross ? j.gross : (r ? r.collected : 0);
+              const expected = (j && (j.gross || j.fees)) || r ? round2(basis - ((j && j.fees) || 0)) : null;
+              const diff = expected != null && dep != null ? round2(dep - expected) : null;
+              return h('tr', { key:k, style:k === nowMonth ? { background:'var(--surface-2)' } : null },
+                h('td', { style:{ fontWeight:600, whiteSpace:'nowrap' } }, ymLabel(k)),
+                cell(r ? r.collected : null),
+                cell(j && j.gross ? j.gross : null),
+                h('td', { className:'r tnum', style:{ color:'var(--coral)' } }, j && j.fees ? '−' + money(j.fees) : h('span', { className:'dim' }, '—')),
+                cell(expected, { style:{ fontWeight:700 } }),
+                cell(dep != null ? dep : null),
+                diff == null ? h('td', { className:'r dim' }, '—')
+                  : h('td', { className:'r tnum', style:{ fontWeight:600, color:Math.abs(diff) < 25 ? 'var(--green)' : 'var(--amber)' } },
+                      (diff >= 0 ? '+' : '−') + money(Math.abs(diff)),
+                      Math.abs(diff) < 25 ? ' ✓' : '')); })))),
+      h('div', { className:'dim', style:{ fontSize:11.5, marginTop:10, lineHeight:1.6 } },
+        h('b', null, 'How to read this: '),
+        '“Revenue collected” is every payment on the Jane reports inside your saved pay runs (deduped by invoice, all payment methods — card, cash, e-transfer, insurers). ',
+        '“Through Jane Payments” is the card-processed slice from your monthly Jane fee report; that minus fees is what Jane actually pays out to the bank. ',
+        'Import your bank statement and the deposits column fills in — a green ✓ means Jane’s payouts landed as expected; an amber gap means deposits are missing, still in transit, or some card revenue didn’t come through Jane. ',
+        'Months where a payment method column shows “—” just need that source imported.')));
+}
 /* ===================== Accountant view ===================== */
 function AccountantTab(p) {
   const { txns, ledger, settings } = p;
@@ -1773,6 +1904,7 @@ function App() {
   const [buds, setBuds] = useState(() => lsGet(LS.bud, []));
   const [settings, setSettings] = useState(() => ({ ...DEFAULT_SETTINGS, ...lsGet(LS.settings, {}) }));
   const [ledger, setLedger] = useState([]);
+  const [revLines, setRevLines] = useState(() => lsGet('rvbk_rev_v1', []));
   const [token, setToken] = useState(() => lsGetStr(LS.tok));
   const [refreshTok, setRefreshTok] = useState(() => lsGetStr(LS.refresh));
   const [user, setUser] = useState(() => lsGetStr(LS.user));
@@ -1847,8 +1979,10 @@ function App() {
         supaSelect(t, 'bk_accounts', 'select=*'),
         supaSelect(t, 'bk_recurring', 'select=*'),
         supaSelect(t, 'bk_budgets', 'select=*'),
-        supaSelect(t, 'payout_ledger', 'select=id,period_from,period_to,cohort_label,title,totals,lines,saved_at&order=period_from.asc')
+        supaSelect(t, 'payout_ledger', 'select=id,period_from,period_to,cohort_label,title,totals,lines,snapshot,saved_at&order=period_from.asc')
       ]);
+      const rl = revenueLinesFromLedger(ledRows);
+      setRevLines(rl); lsSet('rvbk_rev_v1', rl);
       // merge: server + local-only rows (pushed up)
       const srvTx = txRows.map(txFromRow);
       const srvIds = new Set(srvTx.map(x => x.id));
@@ -1890,7 +2024,12 @@ function App() {
         setSetupNeeded(true);
         setMsg('Cloud tables not set up yet — run the setup SQL once (see the yellow banner). Working locally meanwhile.');
         // still try to pull payroll ledger which does exist
-        try { const ledRows = await supaSelect(t, 'payout_ledger', 'select=id,period_from,period_to,cohort_label,title,totals,lines,saved_at&order=period_from.asc'); setLedger(ledRows.map(ledgerFromRow)); } catch(e2){}
+        try {
+          const ledRows = await supaSelect(t, 'payout_ledger', 'select=id,period_from,period_to,cohort_label,title,totals,lines,snapshot,saved_at&order=period_from.asc');
+          setLedger(ledRows.map(ledgerFromRow));
+          const rl = revenueLinesFromLedger(ledRows);
+          setRevLines(rl); lsSet('rvbk_rev_v1', rl);
+        } catch(e2){}
       } else {
         setMsg('Offline or sync error: ' + err.message);
       }
@@ -1975,7 +2114,7 @@ function App() {
   if (!token && showLogin) {
     return h('div', { className:'wrap' }, h(LoginGate, { msg, busy, onLogin:login, onSkip:enterLocal }));
   }
-  const TABS = [['overview','Overview'], ['ledger','Transactions'], ['payroll','Payroll'], ['accountant','Accountant'], ['budget','Budget'], ['settings','Settings']];
+  const TABS = [['overview','Overview'], ['ledger','Transactions'], ['revenue','Revenue'], ['payroll','Payroll'], ['accountant','Accountant'], ['budget','Budget'], ['settings','Settings']];
   return h('div', { className:'wrap' },
     h('div', { className:'topbar' },
       h('div', { className:'brand' },
@@ -1998,6 +2137,7 @@ function App() {
       h('button', { key:id, className:'tab' + (tab === id ? ' on' : ''), onClick:() => setTab(id) }, label))),
     tab === 'overview' ? h(OverviewTab, { txns, accounts, recs, ledger, settings }) : null,
     tab === 'ledger' ? h(LedgerTab, { txns, accounts, onSave:saveTxns, onDelete:deleteTx }) : null,
+    tab === 'revenue' ? h(RevenueTab, { revLines, txns, signedIn:!!token }) : null,
     tab === 'payroll' ? h(PayrollTab, { ledger, settings, signedIn:!!token }) : null,
     tab === 'accountant' ? h(AccountantTab, { txns, ledger, settings, accounts }) : null,
     tab === 'budget' ? h(BudgetTab, { txns, buds, ledger, settings, onSetBudget:setBudget }) : null,
@@ -2006,7 +2146,7 @@ function App() {
       h('span', { style:{ display:'block', marginTop:6, fontWeight:600, color:'var(--pine)' } }, 'build ' + window.__BUILD)));
 }
 /* pure functions exposed for automated smoke-testing; harmless in production */
-window.__BK = { parseDateAny, parseMoneyAny, sniffBankColumns, normalizeBankCsv, normalizeJaneFees, autoCategory, rollup, hstIn, txHash, payrollByMonth, nextPayrollEstimate, upcomingRecurring, readXlsxRows, parseJaneMonthly, guessJaneYear, buildJaneMonthlyRows, monthEndIso };
+window.__BK = { parseDateAny, parseMoneyAny, sniffBankColumns, normalizeBankCsv, normalizeJaneFees, autoCategory, rollup, hstIn, txHash, payrollByMonth, nextPayrollEstimate, upcomingRecurring, readXlsxRows, parseJaneMonthly, guessJaneYear, buildJaneMonthlyRows, monthEndIso, revenueLinesFromLedger, revenueByMonth, janeByMonth };
 ReactDOM.createRoot(document.getElementById('root')).render(h(App));
   }catch(e){ showError((e&&(e.message||String(e)))||'Unknown error'); if(window.console) console.error(e); }
 })();
