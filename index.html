@@ -443,7 +443,7 @@ License: MIT
   try{
     if(typeof React==='undefined'||typeof ReactDOM==='undefined') return showError('React failed to initialize.');
     if(typeof Papa==='undefined') return showError('PapaParse failed to initialize.');
-    window.__BUILD='B12';
+    window.__BUILD='B15';
 const h = React.createElement;
 const { useState, useMemo, useRef, useEffect, useCallback } = React;
 /* ---------- formatting ---------- */
@@ -516,6 +516,51 @@ const AUTO_RULES = [
   { rx:/loan|lease pmt|financing|cwb|ncf/i, expense:'loan' },
   { rx:/deposit|dep\b/i, income:'jane_deposits' }
 ];
+/* common accounting names → Books categories, so hand-built / AI-combined
+   files map cleanly. Anything not matched is FLAGGED as unmapped rather than
+   silently guessed, and remembered so the list can be brought back to Claude
+   to wire in permanently. */
+const CAT_ALIASES = {
+  'rent':'rent', 'rent & cam':'rent', 'cam':'rent', 'lease payment':'rent',
+  'wages':'payroll', 'salaries':'payroll', 'salary':'payroll', 'payroll':'payroll', 'contractors':'payroll', 'contractor payments':'payroll',
+  'utilities':'utilities', 'hydro':'utilities', 'gas bill':'utilities', 'internet':'utilities', 'phone':'utilities', 'telecom':'utilities',
+  'software':'software', 'subscriptions':'software', 'subscription':'software', 'saas':'software', 'apps':'software',
+  'insurance':'insurance',
+  'marketing':'marketing', 'advertising':'marketing', 'ads':'marketing', 'promotion':'marketing', 'community':'marketing',
+  'supplies':'supplies', 'office supplies':'supplies', 'clinic supplies':'supplies', 'inventory':'supplies', 'orders':'supplies', 'medical supplies':'supplies',
+  'repairs':'repairs', 'maintenance':'repairs', 'repairs and maintenance':'repairs', 'repairs & maintenance':'repairs', 'clinic fixes':'repairs',
+  'equipment':'equipment', 'buildout':'equipment', 'capital':'equipment', 'furniture':'equipment',
+  'bank fees':'bank_fees', 'bank charges':'bank_fees', 'service charges':'bank_fees', 'interest':'bank_fees', 'card fees':'bank_fees',
+  'professional fees':'professional', 'accounting':'professional', 'accountant':'professional', 'legal':'professional', 'bookkeeping':'professional', 'consulting':'professional',
+  'loan':'loan', 'loan payment':'loan', 'financing':'loan', 'debt':'loan',
+  'transfer':'transfer', 'transfers':'transfer', 'internal transfer':'transfer',
+  'owner draw':'owner_draw', 'draw':'owner_draw', 'dividend':'owner_draw',
+  'hst':'hst_remit', 'gst':'hst_remit', 'hst remittance':'hst_remit', 'tax remittance':'hst_remit', 'cra':'hst_remit', 'sales tax':'hst_remit',
+  'jane fees':'jane_fees', 'processing fees':'jane_fees', 'merchant fees':'jane_fees', 'payment processing':'jane_fees',
+  'revenue':'jane_deposits', 'sales':'jane_deposits', 'deposits':'jane_deposits', 'card revenue':'jane_deposits', 'jane':'jane_deposits',
+  'insurer':'insurer_rev', 'insurance revenue':'insurer_rev', 'eclaims':'insurer_rev', 'direct billing':'insurer_rev',
+  'cash revenue':'cash_rev', 'cash sales':'cash_rev', 'e-transfer revenue':'cash_rev',
+  'income':'other_income', 'other income':'other_income', 'misc income':'other_income',
+  'other':'other_expense', 'misc':'other_expense', 'miscellaneous':'other_expense'
+};
+function mapCategoryName(raw) {
+  const cv = String(raw || '').trim().toLowerCase();
+  if (!cv) return null;
+  if (CAT_ALIASES[cv]) return CAT_ALIASES[cv];
+  const exact = CATS.find(c => c.id === cv || c.label.toLowerCase() === cv);
+  if (exact) return exact.id;
+  const partial = CATS.find(c => cv.length > 3 && c.label.toLowerCase().indexOf(cv) > -1);
+  return partial ? partial.id : null;
+}
+const UNMAPPED_KEY = 'rvbk_unmapped_v1';
+function rememberUnmapped(names) {
+  const store = lsGet(UNMAPPED_KEY, {});
+  Object.keys(names || {}).forEach(n => {
+    store[n] = { count:((store[n] && store[n].count) || 0) + names[n].count, last:todayIso(), example:names[n].example || (store[n] && store[n].example) || '' };
+  });
+  lsSet(UNMAPPED_KEY, store);
+  return store;
+}
 function autoCategory(desc, kind) {
   for (const r of AUTO_RULES) {
     if (!r.rx.test(desc || '')) continue;
@@ -640,7 +685,39 @@ function budFromRow(r) {
 /* payroll ledger (read-only feed from the payroll dashboard) */
 function ledgerFromRow(r) {
   return { id:r.id, from:r.period_from || '', to:r.period_to || '', cohortLabel:r.cohort_label || 'All',
-    title:r.title || '', totals:r.totals || {}, nStaff:(r.lines || []).length, savedAt:r.saved_at || '' };
+    title:r.title || '', totals:r.totals || {}, nStaff:(r.lines || []).length, savedAt:r.saved_at || '',
+    lines:(r.lines || []).map(l => ({ name:l.name || '', net:parseFloat(l.net) || 0, hst:parseFloat(l.hst) || 0 })) };
+}
+/* Payroll on a CASH basis: each contractor's net is booked to the day the
+   money actually went out — the "paid" stamp payroll records per person in
+   the payroll dashboard (payouts spread through the week, and this follows
+   them). Anyone not yet marked paid is a PENDING payout: committed money.
+   Runs with no sign-off data fall back to the period end. */
+function buildPayrollCash(ledger, signoffs) {
+  const byMonth = {};
+  const events = [];
+  let pending = 0, pendingN = 0, dated = 0, undated = 0;
+  (ledger || []).forEach(e => (e.lines || []).forEach(l => {
+    if (!l.name && !(l.net > 0)) return;
+    const so = signoffs[(e.from || '') + '|' + (e.to || '') + '|' + (l.name || '')] || {};
+    const paidDate = so.paid && so.paidAt ? String(so.paidAt).slice(0, 10) : '';
+    const ev = { name:l.name, net:l.net || 0, hst:l.hst || 0, from:e.from, to:e.to,
+      cohortLabel:e.cohortLabel, paid:!!so.paid, date:paidDate };
+    events.push(ev);
+    if (so.paid) {
+      const k = ym(paidDate || e.to || e.from);
+      if (paidDate) dated++; else undated++;
+      if (k) {
+        byMonth[k] = byMonth[k] || { net:0, hst:0 };
+        byMonth[k].net = round2(byMonth[k].net + ev.net);
+        byMonth[k].hst = round2(byMonth[k].hst + ev.hst);
+      }
+    } else {
+      pending = round2(pending + ev.net);
+      pendingN++;
+    }
+  }));
+  return { byMonth, events, pending, pendingN, dated, undated, hasData:dated > 0 };
 }
 /* Revenue feed: each saved pay run snapshots the full Jane report it was built
    from — every invoice line with what was collected. Aggregating those lines
@@ -703,7 +780,7 @@ function lsGet(k, fb) { try { const v = localStorage.getItem(k); return v == nul
 function lsGetStr(k) { try { return localStorage.getItem(k) || ''; } catch(e){ return ''; } }
 function lsSet(k, v) { try { localStorage.setItem(k, typeof v === 'string' ? v : JSON.stringify(v)); } catch(e){} }
 function lsDel(k) { try { localStorage.removeItem(k); } catch(e){} }
-const DEFAULT_SETTINGS = { payrollSource:'ledger', hstSetAside:true, revenueSource:'jane' };
+const DEFAULT_SETTINGS = { payrollSource:'ledger', hstSetAside:true, revenueSource:'jane', payrollTiming:'cash' };
 /* ---------- CSV parsing: bank statements & Jane reports ----------
    Bank exports vary wildly (RBC/TD/Scotia/BMO/etc). This is a tolerant parser:
    it sniffs which columns are the date, the description, and the amount —
@@ -778,11 +855,19 @@ function sniffBankColumns(fields, rows) {
   }
   return { dateCol, descCol, amtCol, debCol, creCol };
 }
-/* returns { rows:[{date,description,amount(signed)}], cols, issues } */
+/* returns { rows:[{date,description,amount(signed), location?, category?}], cols, issues }
+   Extra columns in hand-built / AI-combined files are honored: a Location
+   column tags each line to its clinic, and a Category column that matches the
+   books' categories is used instead of auto-categorization. */
 function normalizeBankCsv(res) {
   const fields = res.meta.fields || [];
   const data = (res.data || []).filter(r => Object.values(r).some(v => String(v||'').trim() !== ''));
   const cols = sniffBankColumns(fields, data);
+  const lcf = fields.map(f => (f || '').toLowerCase().trim());
+  const locIdx = lcf.findIndex(x => x === 'location' || x === 'clinic' || x === 'branch');
+  const catIdx = lcf.findIndex(x => x === 'category' || x === 'expense category' || x === 'type');
+  const locCol = locIdx > -1 ? fields[locIdx] : null;
+  const catCol = catIdx > -1 ? fields[catIdx] : null;
   const issues = [];
   if (!cols.dateCol) issues.push('Could not find a date column.');
   if (!cols.amtCol && !(cols.debCol || cols.creCol)) issues.push('Could not find an amount column.');
@@ -800,9 +885,45 @@ function normalizeBankCsv(res) {
     }
     if (isNaN(amt) || amt === 0) return;
     const desc = String((cols.descCol ? r[cols.descCol] : '') || '').trim().replace(/\s+/g,' ');
-    rows.push({ date, description:desc || '(no description)', amount:round2(amt) });
+    const row = { date, description:desc || '(no description)', amount:round2(amt) };
+    if (locCol) {
+      const lv = String(r[locCol] || '').toLowerCase();
+      const match = LOCATIONS.find(L => lv.indexOf(L.toLowerCase()) > -1);
+      if (match) row.location = match;
+    }
+    if (catCol) {
+      const raw = String(r[catCol] || '').trim();
+      if (raw) {
+        const mapped = mapCategoryName(raw);
+        if (mapped) row.category = mapped;
+        else row.rawCategory = raw; // flagged, never silently guessed away
+      }
+    }
+    rows.push(row);
   });
   return { rows, cols, issues };
+}
+/* worksheet rows (array-of-arrays) → the Papa-style result normalizeBankCsv
+   expects: sniff the header row, then build objects. Lets bank statements
+   arrive as Excel files, not just CSV. */
+function aoaToResult(aoa) {
+  const scored = (aoa || []).slice(0, 12).map((row, i) => {
+    const cells = (row || []).map(x => String(x == null ? '' : x).trim()).filter(Boolean);
+    const texty = cells.filter(x => /[A-Za-z]{2,}/.test(x) && isNaN(parseMoneyAny(x)) && !parseDateAny(x)).length;
+    return { i, n:cells.length, texty };
+  }).filter(x => x.n >= 2);
+  let hi = 0;
+  let best = -1;
+  scored.forEach(x => { if (x.texty > best) { best = x.texty; hi = x.i; } });
+  const header = (aoa[hi] || []).map((x, i) => { const s = String(x == null ? '' : x).trim(); return s || ('col' + (i + 1)); });
+  const seen = {};
+  const fields = header.map(f => { if (seen[f] == null) { seen[f] = 0; return f; } seen[f]++; return f + '_' + seen[f]; });
+  const data = (aoa || []).slice(hi + 1).map(row => {
+    const o = {};
+    fields.forEach((f, i) => { o[f] = row && row[i] != null ? row[i] : ''; });
+    return o;
+  });
+  return { meta:{ fields }, data };
 }
 /* Jane payments/transactions export → per-day processing-fee totals.
    Looks for a column whose header mentions "fee" and a date column. Whatever
@@ -1224,6 +1345,7 @@ function rollup(txns, opts) {
   const out = { income:0, expense:0, net:0, byCat:{}, hstCollected:0, hstITC:0, n:0 };
   txns.forEach(t => {
     if (o.month && ym(t.date) !== o.month) return;
+    if (o.months && o.months.indexOf(ym(t.date)) === -1) return;
     if (o.year && (t.date||'').slice(0,4) !== o.year) return;
     if (o.location && o.location !== 'all' && t.location !== o.location) return;
     if (o.skipCat && o.skipCat[t.category]) return;
@@ -1417,7 +1539,8 @@ function TxForm(p) {
 }
 /* ===================== Overview ===================== */
 function OverviewTab(p) {
-  const { txns, accounts, recs, ledger, settings } = p;
+  const { txns, accounts, recs, ledger, settings, payCash } = p;
+  const useCash = settings.payrollTiming !== 'period' && payCash && payCash.hasData;
   const nowMonth = ym(todayIso());
   const balances = useMemo(() => accounts.filter(a => !a.archived).map(a => {
     let bal = a.anchor_balance || 0;
@@ -1433,14 +1556,18 @@ function OverviewTab(p) {
   const upcoming = useMemo(() => upcomingRecurring(recs, 30), [recs]);
   const upcomingTotal = round2(upcoming.reduce((s,x) => s + (x.amount || 0), 0));
   const payEst = useMemo(() => nextPayrollEstimate(ledger), [ledger]);
+  // real pending payouts (saved runs, not yet marked paid) beat any estimate
+  const pendingPay = payCash && payCash.pending > 0 ? payCash.pending : (payEst ? payEst.avg : 0);
+  const pendingIsReal = !!(payCash && payCash.pending > 0);
   // HST set-aside: collected − ITCs (incl. HST paid to contractors via payroll), year to date, minus remittances already made
   const year = todayIso().slice(0,4);
   const yr = useMemo(() => rollup(txns, { year, skipBankJaneDeposits:settings.revenueSource !== 'bank' }), [txns, year, settings.revenueSource]);
-  const pbm = useMemo(() => payrollByMonth(ledger), [ledger]);
+  const pbmAcc = useMemo(() => payrollByMonth(ledger), [ledger]);
+  const pbm = useCash ? payCash.byMonth : pbmAcc;
   const payrollHstYtd = round2(Object.keys(pbm).filter(k => k.slice(0,4) === year).reduce((s,k) => s + pbm[k].hst, 0));
   const remitted = round2(txns.filter(t => t.category === 'hst_remit' && (t.date||'').slice(0,4) === year).reduce((s,t) => s + (t.amount||0), 0));
   const hstOwing = round2(yr.hstCollected - yr.hstITC - payrollHstYtd - remitted);
-  const committed = round2(upcomingTotal + (payEst ? payEst.avg : 0) + (settings.hstSetAside ? Math.max(0, hstOwing) : 0));
+  const committed = round2(upcomingTotal + pendingPay + (settings.hstSetAside ? Math.max(0, hstOwing) : 0));
   const available = round2(totalCash - committed);
   // last 6 months cashflow (txns + payroll from ledger when source=ledger)
   const months = useMemo(() => {
@@ -1468,7 +1595,7 @@ function OverviewTab(p) {
       h(Metric, { lab:'Cash in the bank', val:money(totalCash), cls:'v-teal',
         hint:balances.length ? balances.filter(a => a.type !== 'credit').map(a => a.name + ' ' + money(a.balance)).join(' · ') : 'Add your bank account(s) in Settings' }),
       h(Metric, { lab:'Committed next 30 days', val:money(committed), mcls:'m-amber', cls:'v-amber',
-        hint:(payEst ? 'incl. ~' + money(payEst.avg) + ' payroll' + (payEst.nextDate ? ' due ' + payEst.nextDate : '') : 'no payroll runs yet')
+        hint:(pendingIsReal ? 'incl. ' + money(pendingPay) + ' payouts not yet sent (' + payCash.pendingN + ' people)' : payEst ? 'incl. ~' + money(payEst.avg) + ' payroll est.' + (payEst.nextDate ? ' due ' + payEst.nextDate : '') : 'no payroll runs yet')
           + (settings.hstSetAside && hstOwing > 0 ? ' · ' + money(hstOwing) + ' HST set-aside' : '') }),
       h(Metric, { lab:'Actually available', val:money(available), mcls:available >= 0 ? 'm-green' : 'm-coral', cls:available >= 0 ? 'v-green' : 'v-red',
         hint:'cash minus upcoming rent/recurring, payroll & HST' }),
@@ -1486,8 +1613,14 @@ function OverviewTab(p) {
     h('div', { className:'sec' },
       h('div', { className:'sec-h' }, h('h3', null, 'Coming up — next 30 days'),
         h('span', { className:'dim', style:{ fontSize:12 } }, money(upcomingTotal), payEst ? ' + ~' + money(payEst.avg) + ' payroll' : '')),
-      upcoming.length || payEst ? h('div', null,
-        payEst ? h('div', { className:'row' },
+      upcoming.length || payEst || pendingIsReal ? h('div', null,
+        pendingIsReal ? h('div', { className:'row' },
+          h('span', { className:'pill b-purple' }, payCash.pendingN),
+          h('div', { className:'rmain' },
+            h('div', { className:'rt' }, 'Payouts not yet sent'),
+            h('div', { className:'rs' }, payCash.pendingN + ' contractors from saved pay runs — live from the payroll dashboard sign-offs')),
+          h('div', { className:'ramt v-coral num' }, money(payCash.pending)))
+        : payEst ? h('div', { className:'row' },
           h('span', { className:'pill b-purple' }, '⟳'),
           h('div', { className:'rmain' },
             h('div', { className:'rt' }, 'Next payroll (estimated)'),
@@ -1509,18 +1642,19 @@ function ImportPanel(p) {
   const [defAcc, setDefAcc] = useState((p.accounts[0] && p.accounts[0].id) || '');
   const [jYear, setJYear] = useState(new Date().getFullYear());
   const [hot, setHot] = useState(false);
+  const [unmappedLog, setUnmappedLog] = useState(() => lsGet(UNMAPPED_KEY, {}));
   const fileRef = useRef();
   const existingHashes = useMemo(() => { const s = new Set(); p.txns.forEach(t => t.hash && s.add(t.hash)); return s; }, [p.txns]);
   const mapNormRows = (norm, source, forceCat) => norm.rows.map(r => {
     const kind = r.amount >= 0 ? 'income' : 'expense';
-    const category = forceCat || autoCategory(r.description, kind);
+    const category = forceCat || r.category || autoCategory(r.description, kind);
     const c = catById(category);
     const amt = Math.abs(r.amount);
     const t = { id:uid(), date:r.date, description:r.description, category, kind:(c && c.kind !== 'neutral') ? c.kind : kind,
-      location:defLoc, amount:amt, hst:(c && c.hst) ? hstIn(amt) : 0,
+      location:r.location || defLoc, amount:amt, hst:(c && c.hst) ? hstIn(amt) : 0,
       account_id:defAcc, source };
     t.hash = txHash(t);
-    return { t, dupe:existingHashes.has(t.hash), include:!existingHashes.has(t.hash) };
+    return { t, dupe:existingHashes.has(t.hash), include:!existingHashes.has(t.hash), rawCategory:r.rawCategory || null };
   });
   /* Jane files: the Monthly Processing Report is an Excel workbook (even when
      named .csv) with per-location monthly fee totals; a per-transaction CSV
@@ -1577,16 +1711,39 @@ function ImportPanel(p) {
     setPreview(pv => pv && pv.kind === 'monthly' && pv.monthly
       ? { ...pv, rows:buildJaneMonthlyRows(pv.monthly, year, defLoc, defAcc, existingHashes) } : pv);
   };
-  const onFile = files => {
+  const onFile = async files => {
     const f = files && files[0];
     if (!f) return;
     if (fileRef.current) fileRef.current.value = '';
+    let buf;
+    try { buf = await f.arrayBuffer(); } catch (e) { return; }
+    const u8 = new Uint8Array(buf);
+    // PDFs and old-format .xls can't be read in the browser — say so plainly
+    if (u8[0] === 0x25 && u8[1] === 0x50 && u8[2] === 0x44 && u8[3] === 0x46) {
+      setPreview({ kind:'tx', rows:[], fileName:f.name, issues:[
+        'This is a PDF statement — those can’t be read reliably here. Best options: your bank’s CSV/Excel export (look for “Download” or “Export transactions”), your own combined CSV, or send the PDF to Claude in chat to convert into an importable file.'] });
+      return;
+    }
+    if (u8[0] === 0xD0 && u8[1] === 0xCF && u8[2] === 0x11 && u8[3] === 0xE0) {
+      setPreview({ kind:'tx', rows:[], fileName:f.name, issues:[
+        'This is an old-format Excel file (.xls). Open it in Excel and re-save as .xlsx or CSV — or send it to Claude in chat to convert — then drop it here.'] });
+      return;
+    }
     if (mode === 'jane') { handleJaneFile(f); return; }
-    Papa.parse(f, { header:true, skipEmptyLines:true, transformHeader:x => (x||'').trim(),
-      complete:res => {
-        const norm = normalizeBankCsv(res);
-        setPreview({ kind:'tx', rows:mapNormRows(norm, 'bank', null), issues:norm.issues, fileName:f.name, gross:norm.gross });
-      } });
+    let res;
+    if (u8[0] === 0x50 && u8[1] === 0x4B) {
+      // modern Excel workbook
+      try { res = aoaToResult(await readXlsxRows(buf)); }
+      catch (err) { setPreview({ kind:'tx', rows:[], fileName:f.name, issues:[err.message || 'Could not read this Excel file.'] }); return; }
+    } else {
+      res = Papa.parse(new TextDecoder().decode(buf), { header:true, skipEmptyLines:true, transformHeader:x => (x || '').trim() });
+    }
+    const norm = normalizeBankCsv(res);
+    const rows = mapNormRows(norm, 'bank', null);
+    const un = {};
+    rows.forEach(r => { if (r.rawCategory) { un[r.rawCategory] = un[r.rawCategory] || { count:0, example:r.t.description }; un[r.rawCategory].count++; } });
+    if (Object.keys(un).length) setUnmappedLog(rememberUnmapped(un));
+    setPreview({ kind:'tx', rows, issues:norm.issues, fileName:f.name, gross:norm.gross, unmapped:un });
   };
   const updRow = (i, patch) => setPreview(pv => {
     const rows = pv.rows.slice();
@@ -1628,6 +1785,14 @@ function ImportPanel(p) {
       h(Fld, { label:'Default location', select:true, value:defLoc, onChange:setDefLoc, flex:'0 0 140px', children:LocOptions() }),
       p.accounts.length ? h(Fld, { label:'Into account', select:true, value:defAcc, onChange:setDefAcc, flex:'0 0 150px',
         children:[h('option', { key:'', value:'' }, '—')].concat(p.accounts.map(a => h('option', { key:a.id, value:a.id }, a.name))) }) : null),
+    Object.keys(unmappedLog).length ? h('div', { className:'warnbox', style:{ marginBottom:12, alignItems:'center' } },
+      h('span', null, '⚑'),
+      h('span', { style:{ flex:1 } }, h('b', null, 'Category names your files use that Books doesn’t recognize yet: '),
+        Object.keys(unmappedLog).sort((a,b) => unmappedLog[b].count - unmappedLog[a].count)
+          .map(n => '“' + n + '” (' + unmappedLog[n].count + ')').join(' · '),
+        h('span', { className:'dim', style:{ display:'block', fontSize:11.5, marginTop:2 } }, 'Bring this list to Claude to map these names or add them as new categories — then imports will file them automatically.')),
+      h('button', { className:'ghost', style:{ padding:'4px 10px', fontSize:12, flexShrink:0 },
+        onClick:() => { lsDel(UNMAPPED_KEY); setUnmappedLog({}); } }, 'Clear list')) : null,
     !preview ? h('div', { className:'drop' + (hot ? ' hot' : ''),
         onDragOver:e => { e.preventDefault(); setHot(true); }, onDragLeave:() => setHot(false),
         onDrop:e => { e.preventDefault(); setHot(false); onFile(e.dataTransfer.files); } },
@@ -1635,11 +1800,15 @@ function ImportPanel(p) {
       h('h2', null, mode === 'jane' ? 'Drop a Jane report' : 'Drop a bank statement CSV'),
       h('p', null, mode === 'jane'
         ? h('span', null, 'Drops any of three Jane reports, auto-detected: the ', h('b', null, 'Daily Transaction Report'), ' (revenue by payment method + processing fees — the main monthly upload), a ', h('b', null, 'Sales export'), ' (updates accounts receivable — who still owes you), or the ', h('b', null, 'Monthly Processing Report'), ' (fees only). Nothing saves until you review the preview.')
-        : 'Any bank’s CSV export works — columns are detected automatically (date, description, amount or debit/credit). Every line is auto-categorized and shown for review; duplicates you’ve already imported are skipped.'),
-      h('input', { ref:fileRef, type:'file', accept:mode === 'jane' ? '.csv,.xlsx' : '.csv', style:{ display:'none' }, onChange:e => onFile(e.target.files) }),
-      h('button', { className:'filebtn', onClick:() => fileRef.current && fileRef.current.click() }, mode === 'jane' ? 'Choose file' : 'Choose CSV file'))
+        : h('span', null, 'Bank CSV or Excel (.xlsx) exports work, and so do your own combined files — columns are detected automatically (date, description, amount or debit/credit), and if your file already has ', h('b', null, 'Location'), ' or ', h('b', null, 'Category'), ' columns those are honored. Everything is auto-categorized and shown for review; duplicates are skipped. PDF or old .xls statements: send them to Claude in chat to convert.')),
+      h('input', { ref:fileRef, type:'file', accept:'.csv,.xlsx,.xls,.txt', style:{ display:'none' }, onChange:e => onFile(e.target.files) }),
+      h('button', { className:'filebtn', onClick:() => fileRef.current && fileRef.current.click() }, 'Choose file'))
     : h('div', null,
       preview.issues.map((x,i) => h('div', { className:'errbox', key:i, style:{ marginBottom:10 } }, h('span', null, '⚠'), h('span', null, x))),
+      preview.unmapped && Object.keys(preview.unmapped).length ? h('div', { className:'warnbox', style:{ marginBottom:10, flexDirection:'column', alignItems:'stretch', gap:4 } },
+        h('div', { style:{ fontWeight:700 } }, '⚑ ' + Object.keys(preview.unmapped).length + ' category name' + (Object.keys(preview.unmapped).length > 1 ? 's' : '') + ' in this file that Books doesn’t recognize'),
+        h('div', null, Object.keys(preview.unmapped).map(n => '“' + n + '” (' + preview.unmapped[n].count + ' line' + (preview.unmapped[n].count > 1 ? 's' : '') + ')').join(' · ')),
+        h('div', { style:{ opacity:.85 } }, 'Those lines were auto-categorized from their descriptions instead — each is flagged below so you can review, and the names are saved to the list at the top of this panel. Bring that list back to Claude to map them permanently or add new categories.')) : null,
       h('div', { style:{ display:'flex', gap:10, alignItems:'center', flexWrap:'wrap', marginBottom:10 } },
         h('span', { style:{ fontWeight:600, fontSize:13 } }, preview.fileName),
         h('span', { className:'badge b-teal' }, preview.rows.length + (preview.kind === 'monthly' ? ' months' : preview.kind === 'daily' ? ' monthly lines' : ' rows')),
@@ -1742,8 +1911,9 @@ function ImportPanel(p) {
               style:{ width:15, height:15, accentColor:'var(--teal)' } })),
             h('td', { className:'tnum dim', style:{ whiteSpace:'nowrap' } }, r.t.date, r.dupe ? h('span', { className:'badge b-amber', style:{ marginLeft:6 } }, 'dupe') : null),
             h('td', { style:{ maxWidth:280, overflow:'hidden', textOverflow:'ellipsis' } }, r.t.description),
-            h('td', null, h('select', { className:'f', style:{ fontSize:12, padding:'4px 6px' }, value:r.t.category,
-              onChange:e => updRow(i, { category:e.target.value }) }, CatOptions())),
+            h('td', null, h('select', { className:'f', style:{ fontSize:12, padding:'4px 6px', border:r.rawCategory ? '1px solid var(--amber)' : undefined }, value:r.t.category,
+              onChange:e => updRow(i, { category:e.target.value }) }, CatOptions()),
+              r.rawCategory ? h('span', { className:'badge b-amber', style:{ marginLeft:5, fontSize:10 }, title:'Your file called this “' + r.rawCategory + '” — Books doesn’t know that category, so it was auto-categorized. Fix here, or ask Claude to map the name.' }, '⚑ ' + r.rawCategory) : null),
             h('td', null, h('select', { className:'f', style:{ fontSize:12, padding:'4px 6px' }, value:r.t.location,
               onChange:e => updRow(i, { location:e.target.value }) }, LocOptions())),
             h('td', { className:'r tnum', style:{ color:r.t.kind === 'income' ? 'var(--green)' : 'var(--ink)' } },
@@ -1857,35 +2027,75 @@ function LedgerTab(p) {
 }
 /* ===================== Payroll feed ===================== */
 function PayrollTab(p) {
-  const pbm = useMemo(() => payrollByMonth(p.ledger), [p.ledger]);
-  const months = Object.keys(pbm).sort().reverse();
+  const { payCash, settings } = p;
+  const hasCash = payCash && payCash.hasData;
+  const pbmAcc = useMemo(() => payrollByMonth(p.ledger), [p.ledger]);
+  const months = Object.keys(pbmAcc).sort().reverse();
   const ytdKey = todayIso().slice(0,4);
-  const ytd = round2(months.filter(k => k.slice(0,4) === ytdKey).reduce((s,k) => s + pbm[k].net, 0));
-  const ytdHst = round2(months.filter(k => k.slice(0,4) === ytdKey).reduce((s,k) => s + pbm[k].hst, 0));
+  const ytd = round2(months.filter(k => k.slice(0,4) === ytdKey).reduce((s,k) => s + pbmAcc[k].net, 0));
+  const ytdHst = round2(months.filter(k => k.slice(0,4) === ytdKey).reduce((s,k) => s + pbmAcc[k].hst, 0));
+  const cashYtd = hasCash ? round2(Object.keys(payCash.byMonth).filter(k => k.slice(0,4) === ytdKey).reduce((s,k) => s + payCash.byMonth[k].net, 0)) : 0;
+  // per-run payout progress from the sign-off events
+  const runProgress = useMemo(() => {
+    const m = {};
+    ((payCash && payCash.events) || []).forEach(ev => {
+      const k = (ev.from || '') + '|' + (ev.to || '') + '|' + (ev.cohortLabel || '');
+      m[k] = m[k] || { paidN:0, n:0, paidSum:0, pendSum:0 };
+      m[k].n++;
+      if (ev.paid) { m[k].paidN++; m[k].paidSum = round2(m[k].paidSum + ev.net); }
+      else m[k].pendSum = round2(m[k].pendSum + ev.net);
+    });
+    return m;
+  }, [payCash]);
+  const recentPaid = useMemo(() => ((payCash && payCash.events) || []).filter(ev => ev.paid && ev.date)
+    .sort((a,b) => b.date.localeCompare(a.date)).slice(0, 25), [payCash]);
   return h('div', null,
     h('div', { className:'metrics' },
       h(Metric, { lab:'Pay runs on file', val:String(p.ledger.length), hint:'live from the payroll dashboard ledger' }),
-      h(Metric, { lab:'Payroll YTD (' + ytdKey + ')', val:money(ytd), mcls:'m-purple', cls:'v-teal', hint:'net paid to contractors & staff' }),
+      hasCash ? h(Metric, { lab:'Paid out YTD — cash', val:money(cashYtd), mcls:'m-purple', cls:'v-teal', hint:'booked to the day each payout was actually sent' }) : null,
+      h(Metric, { lab:(hasCash ? 'By pay period YTD' : 'Payroll YTD (' + ytdKey + ')'), val:money(ytd), hint:hasCash ? 'same money, attributed to period end — the accrual view' : 'net paid to contractors & staff' }),
+      hasCash || (payCash && payCash.pendingN) ? h(Metric, { lab:'Pending payouts', val:money((payCash && payCash.pending) || 0), mcls:'m-amber', cls:(payCash && payCash.pending) ? 'v-amber' : 'v-green',
+        hint:(payCash && payCash.pendingN) ? payCash.pendingN + ' contractors not yet marked paid' : 'everyone on saved runs is paid ✓' }) : null,
       h(Metric, { lab:'HST paid to contractors YTD', val:money(ytdHst), hint:'claimable as input tax credits (ITCs)' })),
     p.settings.payrollSource === 'ledger'
       ? h('div', { className:'okbox', style:{ marginBottom:14 } }, h('span', null, '✓'),
-          h('span', null, 'Payroll flows into the books automatically from saved pay runs — ', h('b', null, 'no re-entry'), '. Bank lines categorized “Payroll & contractors” are excluded from the P&L so nothing is counted twice. (Change in Settings.)'))
+          h('span', null, 'Payroll flows into the books automatically from saved pay runs' + (hasCash ? ', dated to when each payout actually went out (payouts spread through the week — the books follow them)' : '') + ' — ', h('b', null, 'no re-entry'), '. Bank lines categorized “Payroll & contractors” are excluded from the P&L so nothing is counted twice. (Timing & source in Settings.)'))
       : h('div', { className:'warnbox', style:{ marginBottom:14 } }, h('span', null, '⚠'),
           h('span', null, 'Payroll is currently taken from ', h('b', null, 'bank transactions'), ', not the payroll dashboard. (Change in Settings.)')),
     !p.ledger.length ? h('div', { className:'card', style:{ padding:26, textAlign:'center' } },
       h('p', { className:'dim' }, p.signedIn
         ? 'No saved pay runs found. Save a run to the ledger in the payroll dashboard and it appears here automatically.'
         : 'Working locally — sign in (top right) to pull your saved pay runs from the payroll dashboard.')) : null,
+    p.ledger.length && !hasCash ? h('div', { className:'warnbox', style:{ marginBottom:14 } }, h('span', null, '⚠'),
+      h('span', null, 'No payout dates found yet. Mark payouts as ', h('b', null, 'paid'), ' in the payroll dashboard (the sign-off on each card) and their real dates flow in here on the next sync — until then payroll is dated to each period’s end.')) : null,
+    recentPaid.length ? h('div', { className:'sec' },
+      h('div', { className:'sec-h' }, h('h3', null, 'Recent payouts — as the money moved'),
+        h('span', { className:'dim', style:{ fontSize:12 } }, 'from the payroll dashboard’s paid stamps')),
+      h('div', { className:'card', style:{ padding:'6px 10px' } },
+        h('table', null,
+          h('thead', null, h('tr', null, h('th', null, 'Paid on'), h('th', null, 'Contractor'), h('th', null, 'Pay period'), h('th', { className:'r' }, 'Net'))),
+          h('tbody', null, recentPaid.map((ev,i) => h('tr', { key:i },
+            h('td', { className:'tnum dim', style:{ whiteSpace:'nowrap' } }, ev.date, ' ', h('span', { style:{ fontSize:10 } }, dayName(ev.date))),
+            h('td', { style:{ fontWeight:600 } }, ev.name),
+            h('td', { className:'dim' }, (ev.from || '') + ' → ' + (ev.to || '')),
+            h('td', { className:'r tnum', style:{ fontWeight:600 } }, money(ev.net)))))))) : null,
     months.map(k => h('div', { className:'sec', key:k },
       h('div', { className:'sec-h' }, h('h3', null, ymLabel(k)),
-        h('span', { className:'dim', style:{ fontSize:12 } }, pbm[k].runs.length + ' run' + (pbm[k].runs.length > 1 ? 's' : '') + ' · net ' + money(pbm[k].net) + ' · HST ' + money(pbm[k].hst))),
-      pbm[k].runs.slice().sort((a,b) => (b.to||'').localeCompare(a.to||'')).map(e => h('div', { className:'row', key:e.id },
-        h('span', { className:'pill b-purple' }, e.nStaff),
-        h('div', { className:'rmain' },
-          h('div', { className:'rt' }, e.title || (e.from + ' → ' + e.to)),
-          h('div', { className:'rs' }, e.from + ' → ' + e.to + ' · ' + (e.cohortLabel || 'All') + ' · ' + e.nStaff + ' people'
-            + ' · gross ' + money((e.totals && e.totals.gross) || 0) + ' · HST ' + money((e.totals && e.totals.hst) || 0))),
-        h('div', { className:'ramt num' }, money((e.totals && e.totals.net) || 0)))))));
+        h('span', { className:'dim', style:{ fontSize:12 } }, pbmAcc[k].runs.length + ' run' + (pbmAcc[k].runs.length > 1 ? 's' : '') + ' · net ' + money(pbmAcc[k].net) + ' · HST ' + money(pbmAcc[k].hst)
+          + (hasCash && payCash.byMonth[k] ? ' · paid out in ' + MONTHS[parseInt(k.slice(5,7),10)-1] + ': ' + money(payCash.byMonth[k].net) : ''))),
+      pbmAcc[k].runs.slice().sort((a,b) => (b.to||'').localeCompare(a.to||'')).map(e => {
+        const pr = runProgress[(e.from || '') + '|' + (e.to || '') + '|' + (e.cohortLabel || '')];
+        return h('div', { className:'row', key:e.id },
+          h('span', { className:'pill b-purple' }, e.nStaff),
+          h('div', { className:'rmain' },
+            h('div', { className:'rt' }, e.title || (e.from + ' → ' + e.to),
+              pr ? (pr.paidN >= pr.n
+                ? h('span', { className:'badge b-green', style:{ marginLeft:8 } }, 'all ' + pr.n + ' paid')
+                : h('span', { className:'badge b-amber', style:{ marginLeft:8 } }, pr.paidN + ' of ' + pr.n + ' paid · ' + money(pr.pendSum) + ' to go')) : null),
+            h('div', { className:'rs' }, e.from + ' → ' + e.to + ' · ' + (e.cohortLabel || 'All') + ' · ' + e.nStaff + ' people'
+              + ' · gross ' + money((e.totals && e.totals.gross) || 0) + ' · HST ' + money((e.totals && e.totals.hst) || 0))),
+          h('div', { className:'ramt num' }, money((e.totals && e.totals.net) || 0)));
+      }))));
 }
 /* ===================== Revenue & bank reconciliation ===================== */
 function RevenueTab(p) {
@@ -2145,18 +2355,32 @@ function ARSection(p) {
 }
 /* ===================== Accountant view ===================== */
 function AccountantTab(p) {
-  const { txns, ledger, settings } = p;
+  const { txns, ledger, settings, payCash } = p;
+  const useCash = settings.payrollTiming !== 'period' && payCash && payCash.hasData;
+  const pbmAcc = useMemo(() => payrollByMonth(ledger), [ledger]);
+  const pbm = useCash ? payCash.byMonth : pbmAcc;
   const monthsAvail = useMemo(() => {
     const s = new Set();
     txns.forEach(t => t.date && s.add(ym(t.date)));
-    Object.keys(payrollByMonth(ledger)).forEach(k => s.add(k));
+    Object.keys(pbm).forEach(k => s.add(k));
     return Array.from(s).sort().reverse();
-  }, [txns, ledger]);
+  }, [txns, pbm]);
+  const quartersAvail = useMemo(() => {
+    const s = new Set();
+    monthsAvail.forEach(k => { const q = Math.floor((parseInt(k.slice(5,7),10) - 1) / 3) + 1; s.add(k.slice(0,4) + '-Q' + q); });
+    return Array.from(s).sort().reverse();
+  }, [monthsAvail]);
   const [period, setPeriod] = useState(monthsAvail[0] || ym(todayIso()));
-  useEffect(() => { if (monthsAvail.length && !monthsAvail.includes(period) && period !== 'ytd') setPeriod(monthsAvail[0]); }, [monthsAvail]);
-  const pbm = useMemo(() => payrollByMonth(ledger), [ledger]);
+  useEffect(() => { if (monthsAvail.length && !monthsAvail.includes(period) && period !== 'ytd' && period.indexOf('-Q') < 0) setPeriod(monthsAvail[0]); }, [monthsAvail]);
+  const isQ = period.indexOf('-Q') > -1;
+  const qMonths = useMemo(() => {
+    if (!isQ) return null;
+    const y = period.slice(0,4), q = parseInt(period.slice(6), 10);
+    return [1,2,3].map(i => y + '-' + ('0' + ((q - 1) * 3 + i)).slice(-2));
+  }, [period]);
   const year = period === 'ytd' ? todayIso().slice(0,4) : period.slice(0,4);
-  const opts = period === 'ytd' ? { year } : { month:period };
+  const opts = period === 'ytd' ? { year } : isQ ? { months:qMonths } : { month:period };
+  const inPeriod = k => period === 'ytd' ? (k || '').slice(0,4) === year : isQ ? qMonths.indexOf(k) > -1 : k === period;
   const skip = settings.payrollSource === 'ledger' ? { payroll:1 } : null;
   const perLoc = useMemo(() => {
     const m = {};
@@ -2166,14 +2390,13 @@ function AccountantTab(p) {
     return m;
   }, [txns, period, settings.payrollSource]);
   const payAmt = useMemo(() => {
-    const keys = Object.keys(pbm).filter(k => period === 'ytd' ? k.slice(0,4) === year : k === period);
+    const keys = Object.keys(pbm).filter(inPeriod);
     return { net:round2(keys.reduce((s,k) => s + pbm[k].net, 0)), hst:round2(keys.reduce((s,k) => s + pbm[k].hst, 0)) };
-  }, [pbm, period]);
+  }, [pbm, period, qMonths]);
   const all = perLoc.__all;
   const totalExp = round2(all.expense + (skip ? payAmt.net : 0));
   const netProfit = round2(all.income - totalExp);
-  const hstRemitted = round2(txns.filter(t => t.category === 'hst_remit' &&
-    (period === 'ytd' ? (t.date||'').slice(0,4) === year : ym(t.date) === period)).reduce((s,t) => s + (t.amount||0), 0));
+  const hstRemitted = round2(txns.filter(t => t.category === 'hst_remit' && inPeriod(ym(t.date))).reduce((s,t) => s + (t.amount||0), 0));
   const hstNet = round2(all.hstCollected - all.hstITC - payAmt.hst);
   const catRows = kind => {
     const ids = CATS.filter(c => c.kind === kind).map(c => c.id);
@@ -2196,7 +2419,7 @@ function AccountantTab(p) {
   const incRows = catRows('income');
   const expRows = catRows('expense');
   const cell = (v, bold) => h('td', { className:'r tnum', style:bold ? { fontWeight:700 } : null }, v ? money(v) : h('span', { className:'dim' }, '—'));
-  const label = period === 'ytd' ? year + ' year-to-date' : ymLabel(period);
+  const label = period === 'ytd' ? year + ' year-to-date' : isQ ? 'Q' + period.slice(6) + ' ' + period.slice(0,4) : ymLabel(period);
   const exportCsv = () => {
     const q = c => '"' + String(c == null ? '' : c).replace(/"/g, '""') + '"';
     const n2 = x => (Math.round((x || 0) * 100) / 100).toFixed(2);
@@ -2226,7 +2449,7 @@ function AccountantTab(p) {
     out.push('');
     out.push(line(['PAYROLL (from payroll dashboard ledger)']));
     out.push(line(['Pay run', 'Period from', 'Period to', 'Cohort', 'People', 'Gross (pre-tax)', 'HST', 'Net paid']));
-    (ledger || []).filter(e => period === 'ytd' ? (e.to||'').slice(0,4) === year : ym(e.to || e.from) === period)
+    (ledger || []).filter(e => inPeriod(ym(e.to || e.from)))
       .sort((a,b) => (a.to||'').localeCompare(b.to||''))
       .forEach(e => out.push(line([e.title || (e.from + ' → ' + e.to), e.from, e.to, e.cohortLabel || 'All', e.nStaff,
         n2(e.totals && e.totals.gross), n2(e.totals && e.totals.hst), n2(e.totals && e.totals.net)])));
@@ -2234,20 +2457,21 @@ function AccountantTab(p) {
     out.push(line(['TRANSACTION DETAIL — ' + label.toUpperCase()]));
     out.push(line(['Date', 'Description', 'Type', 'Category', 'Location', 'Account', 'Source', 'Amount', 'HST included', 'Notes']));
     const accName = id => { const a = p.accounts.find(x => x.id === id); return a ? a.name : ''; };
-    txns.filter(t => period === 'ytd' ? (t.date||'').slice(0,4) === year : ym(t.date) === period)
+    txns.filter(t => inPeriod(ym(t.date)))
       .slice().sort((a,b) => (a.date||'').localeCompare(b.date||''))
       .forEach(t => out.push(line([t.date, t.description, t.kind, catLabel(t.category), t.location, accName(t.account_id), t.source,
         (t.kind === 'income' ? '' : '-') + n2(t.amount), n2(t.hst), t.notes || ''])));
     const csv = '\ufeff' + out.join('\r\n');
     const a = document.createElement('a');
     a.href = URL.createObjectURL(new Blob([csv], { type:'text/csv;charset=utf-8' }));
-    a.download = 'Revibe_Books_' + (period === 'ytd' ? year + '_YTD' : period) + '.csv';
+    a.download = 'Revibe_Books_' + (period === 'ytd' ? year + '_YTD' : period.replace('-Q','_Q')) + '.csv';
     a.click();
   };
   return h('div', null,
     h('div', { style:{ display:'flex', gap:8, alignItems:'flex-end', flexWrap:'wrap', marginBottom:14 } },
       h(Fld, { label:'Period', select:true, value:period, onChange:setPeriod, flex:'0 0 180px',
         children:[h('option', { key:'ytd', value:'ytd' }, todayIso().slice(0,4) + ' — year to date')]
+          .concat(quartersAvail.map(q => h('option', { key:q, value:q }, 'Q' + q.slice(6) + ' ' + q.slice(0,4) + ' — quarter')))
           .concat(monthsAvail.map(m => h('option', { key:m, value:m }, ymLabel(m)))) }),
       h('span', { style:{ flex:1 } }),
       h('button', { className:'ghost no-print', onClick:() => window.print() }, '🖨 Print / PDF'),
@@ -2275,14 +2499,15 @@ function AccountantTab(p) {
               ...LOCATIONS.map(l => cell(round2(perLoc[l].income - perLoc[l].expense), true)), cell(netProfit, true)))))),
     h('div', { className:'dim', style:{ fontSize:11.5, lineHeight:1.6 } },
       'Notes for the accountant: amounts are tax-inclusive with the embedded HST shown separately in the HST summary; ',
-      'payroll comes from the payroll dashboard’s saved runs (contractor invoices, incl. HST where registered) and is not split by location; ',
+      'payroll comes from the payroll dashboard’s saved runs (contractor invoices, incl. HST where registered), dated ' + (useCash ? 'to the day each payout was actually sent (cash basis)' : 'to the pay-period end') + ', and is not split by location; ',
       'transfers, owner draws and HST remittances are tracked but excluded from the P&L. The CSV export contains the full transaction detail.'));
 }
 /* ===================== Budget & projection ===================== */
 function BudgetTab(p) {
-  const { txns, buds, ledger, settings } = p;
+  const { txns, buds, ledger, settings, payCash } = p;
   const nowMonth = ym(todayIso());
-  const pbm = useMemo(() => payrollByMonth(ledger), [ledger]);
+  const pbmAcc = useMemo(() => payrollByMonth(ledger), [ledger]);
+  const pbm = (settings.payrollTiming !== 'period' && payCash && payCash.hasData) ? payCash.byMonth : pbmAcc;
   // avg monthly actual per category over the last 3 full months
   const last3 = useMemo(() => {
     const keys = [];
@@ -2436,6 +2661,13 @@ function SettingsTab(p) {
             h('span', { className:'dim', style:{ display:'block', fontSize:12, lineHeight:1.5, marginTop:2 } },
               'Saved pay runs flow in automatically as the payroll expense; bank lines categorized “Payroll & contractors” are excluded from the P&L so nothing is double-counted. Untick to book payroll from bank transactions instead.'))),
         h('label', { style:{ display:'flex', gap:10, alignItems:'flex-start', cursor:'pointer', marginBottom:14 } },
+          h('input', { type:'checkbox', checked:p.settings.payrollTiming !== 'period',
+            onChange:e => p.onSetSettings({ ...p.settings, payrollTiming:e.target.checked ? 'cash' : 'period' }),
+            style:{ marginTop:2, width:15, height:15, accentColor:'var(--teal)' } }),
+          h('span', null, h('span', { style:{ fontWeight:600, fontSize:13 } }, 'Date payroll by when payouts actually happen (recommended)'),
+            h('span', { className:'dim', style:{ display:'block', fontSize:12, lineHeight:1.5, marginTop:2 } },
+              'Payouts spread through the week — this books each contractor’s pay to the day it was marked paid in the payroll dashboard, so cash flow shows how money truly moves. Untick to date payroll by pay-period end instead (accrual). The Payroll tab always shows both views side by side.'))),
+        h('label', { style:{ display:'flex', gap:10, alignItems:'flex-start', cursor:'pointer', marginBottom:14 } },
           h('input', { type:'checkbox', checked:p.settings.revenueSource !== 'bank',
             onChange:e => p.onSetSettings({ ...p.settings, revenueSource:e.target.checked ? 'jane' : 'bank' }),
             style:{ marginTop:2, width:15, height:15, accentColor:'var(--teal)' } }),
@@ -2464,6 +2696,8 @@ function App() {
   const [payouts, setPayouts] = useState(loadPayouts);
   const [claims, setClaims] = useState(loadClaims);
   const saveClaims = c => { setClaims(applyClaims(claims, c)); };
+  const [paySignoffs, setPaySignoffs] = useState(() => lsGet('rvbk_paysign_v1', {}));
+  const payCash = useMemo(() => buildPayrollCash(ledger, paySignoffs), [ledger, paySignoffs]);
   const updatePayouts = rows => {
     const res = applyPayouts(payouts, rows);
     setPayouts(res.store);
@@ -2585,6 +2819,15 @@ function App() {
         setPayouts(nextPo); lsSet(PAYOUT_KEY, nextPo);
       } catch (e3) {
         // bk_payouts not created yet → payouts stay browser-local
+      }
+      // per-contractor payout dates from the payroll dashboard's sign-offs
+      try {
+        const soRows = await supaSelect(t, 'payout_signoffs', 'select=key,period_from,period_to,staff_name,paid,paid_at');
+        const map = {};
+        soRows.forEach(r => { map[r.key] = { paid:!!r.paid, paidAt:r.paid_at || '' }; });
+        setPaySignoffs(map); lsSet('rvbk_paysign_v1', map);
+      } catch (e4) {
+        // sign-offs unavailable → payroll falls back to period-end dating
       }
       // merge: server + local-only rows (pushed up)
       const srvTx = txRows.map(txFromRow);
@@ -2738,18 +2981,18 @@ function App() {
       h('span', null, h('b', null, 'One-time setup needed:'), ' the bookkeeping tables don’t exist in Supabase yet. Open the Supabase dashboard → SQL Editor and run the ', h('b', null, 'revibe-books-setup.sql'), ' script that came with this dashboard, then hit Sync now. Everything you enter meanwhile is kept in this browser and pushed up automatically.')) : null,
     h('div', { className:'tabs no-print' }, TABS.map(([id, label]) =>
       h('button', { key:id, className:'tab' + (tab === id ? ' on' : ''), onClick:() => setTab(id) }, label))),
-    tab === 'overview' ? h(OverviewTab, { txns, accounts, recs, ledger, settings }) : null,
+    tab === 'overview' ? h(OverviewTab, { txns, accounts, recs, ledger, settings, payCash }) : null,
     tab === 'ledger' ? h(LedgerTab, { txns, accounts, onSave:saveTxns, onDelete:deleteTx, onUpdateAR:updateAR, onUpdatePayouts:updatePayouts, onSaveClaims:saveClaims }) : null,
     tab === 'revenue' ? h(RevenueTab, { revLines, txns, signedIn:!!token, ar, payouts, claims }) : null,
-    tab === 'payroll' ? h(PayrollTab, { ledger, settings, signedIn:!!token }) : null,
-    tab === 'accountant' ? h(AccountantTab, { txns, ledger, settings, accounts }) : null,
-    tab === 'budget' ? h(BudgetTab, { txns, buds, ledger, settings, onSetBudget:setBudget }) : null,
+    tab === 'payroll' ? h(PayrollTab, { ledger, settings, signedIn:!!token, payCash }) : null,
+    tab === 'accountant' ? h(AccountantTab, { txns, ledger, settings, accounts, payCash }) : null,
+    tab === 'budget' ? h(BudgetTab, { txns, buds, ledger, settings, onSetBudget:setBudget, payCash }) : null,
     tab === 'settings' ? h(SettingsTab, { accounts, recs, settings, onSaveAccount:saveAccount, onSaveRecurring:saveRecurring, onDeleteRecurring:deleteRecurring, onSetSettings:setSettingsAll }) : null,
     h('div', { className:'footer' }, 'Revibe Books · fed by the payroll dashboard ledger · bank & Jane CSV imports · accountant-ready exports',
       h('span', { style:{ display:'block', marginTop:6, fontWeight:600, color:'var(--pine)' } }, 'build ' + window.__BUILD)));
 }
 /* pure functions exposed for automated smoke-testing; harmless in production */
-window.__BK = { parseDateAny, parseMoneyAny, sniffBankColumns, normalizeBankCsv, normalizeJaneFees, autoCategory, rollup, hstIn, txHash, payrollByMonth, nextPayrollEstimate, upcomingRecurring, readXlsxRows, parseJaneMonthly, guessJaneYear, buildJaneMonthlyRows, monthEndIso, revenueLinesFromLedger, revenueByMonth, janeByMonth, parseJaneDaily, buildJaneDailyRows, parseJaneSales, applySalesToAR, arAgeBucket, loadAR, parseJanePayouts, applyPayouts, payoutsByMonth, applyClaims, loadClaims };
+window.__BK = { parseDateAny, parseMoneyAny, sniffBankColumns, normalizeBankCsv, normalizeJaneFees, autoCategory, rollup, hstIn, txHash, payrollByMonth, nextPayrollEstimate, upcomingRecurring, readXlsxRows, parseJaneMonthly, guessJaneYear, buildJaneMonthlyRows, monthEndIso, revenueLinesFromLedger, revenueByMonth, janeByMonth, parseJaneDaily, buildJaneDailyRows, parseJaneSales, applySalesToAR, arAgeBucket, loadAR, parseJanePayouts, applyPayouts, payoutsByMonth, applyClaims, loadClaims, buildPayrollCash, mapCategoryName };
 ReactDOM.createRoot(document.getElementById('root')).render(h(App));
   }catch(e){ showError((e&&(e.message||String(e)))||'Unknown error'); if(window.console) console.error(e); }
 })();
