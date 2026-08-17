@@ -491,7 +491,7 @@ License: MIT
   try{
     if(typeof React==='undefined'||typeof ReactDOM==='undefined') return showError('React failed to initialize.');
     if(typeof Papa==='undefined') return showError('PapaParse failed to initialize.');
-    window.__BUILD='B17';
+    window.__BUILD='B18';
 const h = React.createElement;
 const { useState, useMemo, useRef, useEffect, useCallback } = React;
 /* ---------- formatting ---------- */
@@ -3206,7 +3206,7 @@ function App() {
   const [user, setUser] = useState(() => lsGetStr(LS.user));
   const [msg, setMsg] = useState('');
   const [busy, setBusy] = useState(false);
-  const [setupNeeded, setSetupNeeded] = useState(false);
+  const [setupNeeded, setSetupNeeded] = useState([]); // names of cloud tables the database doesn't have yet
   /* the login screen only appears when the user asks for it — the app opens
      straight into the books, working locally, until they choose to sign in */
   const [showLogin, setShowLogin] = useState(false);
@@ -3256,7 +3256,7 @@ function App() {
         queuePending(table, rows);
         setMsg('Session expired — sign in again to sync (changes kept locally).');
       } else if (/relation .* does not exist|Could not find the table/i.test(err.message)) {
-        setSetupNeeded(true);
+        setSetupNeeded(prev => prev.indexOf(table) > -1 ? prev : prev.concat(table));
         queuePending(table, rows);
       } else {
         queuePending(table, rows);
@@ -3292,7 +3292,7 @@ function App() {
         const nextAr = { invoices:merged, updatedAt:new Date().toISOString(), lastFile:(ar && ar.lastFile) || '' };
         setAr(nextAr); lsSet(AR_KEY, nextAr);
       } catch (e2) {
-        // table not created yet → A/R stays browser-local; anything else is non-fatal too
+        if (/does not exist|Could not find/i.test(e2.message)) setSetupNeeded(prev => prev.indexOf('bk_ar') > -1 ? prev : prev.concat('bk_ar'));
       }
       try {
         const poRows = await supaSelect(t, 'bk_payouts', 'select=*');
@@ -3305,7 +3305,7 @@ function App() {
         const nextPo = { items:merged, updatedAt:new Date().toISOString() };
         setPayouts(nextPo); lsSet(PAYOUT_KEY, nextPo);
       } catch (e3) {
-        // bk_payouts not created yet → payouts stay browser-local
+        if (/does not exist|Could not find/i.test(e3.message)) setSetupNeeded(prev => prev.indexOf('bk_payouts') > -1 ? prev : prev.concat('bk_payouts'));
       }
       // per-contractor payout dates from the payroll dashboard's sign-offs
       try {
@@ -3342,7 +3342,7 @@ function App() {
       const mergedBud = srvBud.concat(budLocal);
       setBuds(mergedBud); lsSet(LS.bud, mergedBud);
       setLedger(ledRows.map(ledgerFromRow));
-      setSetupNeeded(false);
+      setSetupNeeded(prev => prev.filter(t => ['bk_transactions','bk_accounts','bk_recurring','bk_budgets'].indexOf(t) === -1));
       setMsg('Synced — ' + mergedTx.length + ' transactions · ' + ledRows.length + ' pay runs' + (pushed ? ' · ' + pushed + ' queued changes pushed' : ''));
     } catch (err) {
       if (String(err.message).indexOf('401') === 0 && !isRetry) {
@@ -3354,7 +3354,7 @@ function App() {
         return;
       }
       if (/relation .* does not exist|Could not find the table/i.test(err.message)) {
-        setSetupNeeded(true);
+        setSetupNeeded(prev => Array.from(new Set(prev.concat(['bk_transactions','bk_accounts','bk_recurring','bk_budgets']))));
         setMsg('Cloud tables not set up yet — run the setup SQL once (see the yellow banner). Working locally meanwhile.');
         // still try to pull payroll ledger which does exist
         try {
@@ -3476,8 +3476,9 @@ function App() {
           ? h('button', { className:'ghost', onClick:logout, style:{ padding:'6px 12px', fontSize:12 } }, 'Sign out')
           : h('button', { className:'ghost primary', onClick:() => setShowLogin(true), style:{ padding:'6px 12px', fontSize:12 } }, 'Sign in'))),
     msg ? h('div', { className:'dim', style:{ fontSize:12, margin:'8px 2px 0', color:/error|failed|expired|offline/i.test(msg) ? 'var(--red)' : 'var(--ink-3)' } }, msg) : null,
-    setupNeeded ? h('div', { className:'warnbox', style:{ marginTop:10 } }, h('span', null, '⚠'),
-      h('span', null, h('b', null, 'One-time setup needed:'), ' the bookkeeping tables don’t exist in Supabase yet. Open the Supabase dashboard → SQL Editor and run the ', h('b', null, 'revibe-books-setup.sql'), ' script that came with this dashboard, then hit Sync now. Everything you enter meanwhile is kept in this browser and pushed up automatically.')) : null,
+    setupNeeded.length ? h('div', { className:'warnbox', style:{ marginTop:10 } }, h('span', null, '⚠'),
+      h('span', null, h('b', null, 'Cloud setup is behind by ' + setupNeeded.length + ' table' + (setupNeeded.length > 1 ? 's' : '') + ': '),
+        setupNeeded.join(', '), ' — recent features (A/R, Jane payouts, upload grouping) added new blocks to the setup SQL. Run the ', h('b', null, 'latest revibe-books-setup.sql'), ' — the whole file, it’s safe to re-run and only creates what’s missing — in Supabase → SQL Editor, then hit Sync now. Everything keeps working locally meanwhile and pushes up automatically.')) : null,
     h('div', { className:'tabs no-print' }, TABS.map(([id, label]) =>
       h('button', { key:id, className:'tab' + (tab === id ? ' on' : ''), onClick:() => setTab(id) }, label))),
     tab === 'overview' ? h(OverviewTab, { txns, accounts, recs, ledger, settings, payCash }) : null,
