@@ -491,7 +491,7 @@ License: MIT
   try{
     if(typeof React==='undefined'||typeof ReactDOM==='undefined') return showError('React failed to initialize.');
     if(typeof Papa==='undefined') return showError('PapaParse failed to initialize.');
-    window.__BUILD='B18';
+    window.__BUILD='B19';
 const h = React.createElement;
 const { useState, useMemo, useRef, useEffect, useCallback } = React;
 /* ---------- formatting ---------- */
@@ -2599,6 +2599,83 @@ function exportFollowUp(invList) {
   a.download = 'Revibe_FollowUp_List_' + todayIso() + '.csv';
   a.click();
 }
+/* ===================== Guide — the operating manual ===================== */
+function GStep(p) {
+  return h('div', { style:{ display:'flex', gap:14, marginBottom:0 } },
+    h('div', { style:{ display:'flex', flexDirection:'column', alignItems:'center', flexShrink:0 } },
+      h('div', { style:{ width:34, height:34, borderRadius:'50%', background:p.optional ? 'var(--surface-2)' : 'linear-gradient(145deg,var(--pine),var(--teal))',
+        color:p.optional ? 'var(--ink-2)' : '#fff', display:'flex', alignItems:'center', justifyContent:'center',
+        fontFamily:'var(--display)', fontSize:16, boxShadow:p.optional ? 'none' : '0 3px 9px rgba(1,89,77,.25)', border:p.optional ? '1.5px dashed var(--line-2)' : 'none' } }, p.n),
+      p.last ? null : h('div', { style:{ width:2, flex:1, minHeight:14, background:'var(--line-2)', margin:'4px 0' } })),
+    h('div', { style:{ paddingBottom:18, flex:1 } },
+      h('div', { style:{ fontWeight:700, fontSize:14 } }, p.title,
+        p.badge ? h('span', { className:'badge ' + (p.badgeCls || 'b-teal'), style:{ marginLeft:8 } }, p.badge) : null),
+      h('div', { className:'muted', style:{ fontSize:12.5, lineHeight:1.6, marginTop:3 } }, p.children)));
+}
+function GuideTab() {
+  const chip = t => h('span', { className:'badge b-gray', style:{ margin:'0 2px' } }, t);
+  return h('div', null,
+    h('div', { style:{ display:'flex', alignItems:'center', gap:10, flexWrap:'wrap', marginBottom:4 } },
+      h('span', { style:{ flex:1 } }),
+      h('button', { className:'ghost no-print', onClick:() => window.print() }, '🖨 Print this guide')),
+    h('div', { className:'okbox', style:{ marginBottom:16 } }, h('span', null, '🧭'),
+      h('span', null, h('b', null, 'How the books work in one sentence: '), 'Jane reports carry the revenue, the payroll dashboard carries the wage cost, bank statements are the proof the money moved — Books lines all three up and flags anything that doesn’t match. Nothing is ever double-counted.')),
+    h('div', { className:'sec-h' }, h('h3', null, 'The monthly routine — in order')),
+    h('div', { className:'card', style:{ padding:'18px 20px' } },
+      h(GStep, { n:'1', title:'Payroll dashboard first (ongoing, each pay period)' },
+        'Finish each pay run in the payroll dashboard and hit “Save run to ledger.” As payouts go out through the week, tick each contractor’s ',
+        h('b', null, 'paid'), ' sign-off there — those dates drive the books. Books reads all of it automatically; nothing is re-entered.'),
+      h(GStep, { n:'2', title:'Open Books, sign in, Sync now' },
+        'Same login as the payroll dashboard (top right). Sync pulls pay runs, payout dates, and revenue snapshots. If a yellow banner names missing tables, run the latest revibe-books-setup.sql once in Supabase → SQL Editor, then Sync again.'),
+      h(GStep, { n:'3', title:'Import the Jane Daily Transaction Report', badge:'the key upload' },
+        'Jane → Reports → Daily Transaction Report, exported for the month. Drop it at Transactions → Import file → ', h('b', null, 'Jane reports'),
+        '. This books the month’s revenue by payment method (cards per location, insurers, cash/e-transfer) AND the processing fees. Re-uploading later just refreshes the month — mid-month partials are safe.'),
+      h(GStep, { n:'4', title:'Import the Jane Payouts Report' },
+        'From Jane Payments, the payouts list (Date Created / Date Deposited / Amount). Same drop zone — auto-detected. This is what Jane actually sent to the bank, and it powers the Reconcile tab’s dollar-for-dollar matching.'),
+      h(GStep, { n:'5', title:'Import bank statements — every account' },
+        'CSV or Excel export from the bank (or a PDF statement — converted right on the site with balance verification; scanned PDFs go to Claude for OCR). Every line auto-categorizes, ',
+        h('b', null, 'NEW'), ' payees get flagged for a one-time category check (remembered forever after), ⚑ marks unknown category names, and duplicates are skipped automatically.'),
+      h(GStep, { n:'6', title:'Import a Jane Sales export', badge:'weekly is ideal', badgeCls:'b-purple' },
+        'Jane → Reports → Sales, any date range. Refreshes accounts receivable: who still owes money, with aging. Invoices that got paid since the last upload clear automatically. Front desk works from Revenue tab → “Follow-up list” CSV.'),
+      h(GStep, { n:'7', title:'Check the Reconcile tab' },
+        'This is the proof step. Green = every Jane payout found in the bank and every payroll payout matched to a withdrawal. Anything amber/red is one of four things: money in transit, a missing statement, a payout not recorded, or a line that needs recategorizing. Chase until green.'),
+      h(GStep, { n:'8', title:'Review Revenue & Overview' },
+        'Revenue tab: the month chain (revenue → fees → expected into bank → Jane paid out → deposits), insurer money still floating (Sunlife/ProviderConnect/WSIB pay late — a red number that isn’t shrinking is money to chase), and A/R. Overview: cash position and what’s actually available after committed payouts, rent and HST set-aside.'),
+      h(GStep, { n:'9', title:'Month-end: Accountant tab', last:true },
+        'Pick the month (or quarter for HST filings) → “Export for accountant (CSV).” One file: P&L by location, HST summary with ITCs, payroll runs, full transaction detail. That’s what gets sent out.')),
+    h('div', { className:'sec-h', style:{ marginTop:22 } }, h('h3', null, 'Which Jane file does what')),
+    h('div', { className:'card', style:{ padding:'6px 10px' } },
+      h('table', null,
+        h('thead', null, h('tr', null, h('th', null, 'File (all go in the same drop zone — auto-detected)'), h('th', null, 'What it feeds'), h('th', null, 'Cadence'))),
+        h('tbody', null,
+          h('tr', null, h('td', { style:{ fontWeight:600 } }, 'Daily Transaction Report'), h('td', null, 'Revenue by payment method + processing fees + insurer claims tracking'), h('td', null, 'Monthly (partials OK)')),
+          h('tr', null, h('td', { style:{ fontWeight:600 } }, 'Jane Payouts Report'), h('td', null, '“Jane paid out” column + bank reconciliation'), h('td', null, 'Monthly')),
+          h('tr', null, h('td', { style:{ fontWeight:600 } }, 'Sales export'), h('td', null, 'Accounts receivable (who owes, aging, follow-up list)'), h('td', null, 'Weekly or bi-weekly')),
+          h('tr', null, h('td', { style:{ fontWeight:600 } }, 'Monthly Processing Report'), h('td', null, 'Fees only — superseded by the Daily report; use as backup'), h('td', null, 'Only if needed'))))),
+    h('div', { className:'sec-h', style:{ marginTop:22 } }, h('h3', null, 'When something is flagged')),
+    h('div', { className:'card' },
+      h('div', { style:{ fontSize:12.5, lineHeight:1.7 } },
+        h('p', { style:{ margin:'0 0 8px' } }, h('span', { className:'badge b-purple' }, 'NEW'), ' — first time this payee has appeared. Set its category once in the preview; the books remember and file it automatically forever after.'),
+        h('p', { style:{ margin:'0 0 8px' } }, h('span', { className:'badge b-amber' }, '⚑ unknown category'), ' — a file used a category name Books doesn’t know. It’s auto-categorized for now and the name is saved to a list at the top of the import panel — pass that list to Claude to map permanently.'),
+        h('p', { style:{ margin:'0 0 8px' } }, h('span', { className:'badge b-amber' }, 'already imported'), ' — duplicate protection; the line is skipped. ', h('span', { className:'badge b-purple' }, 'updates existing'), ' — a refreshed figure replaces the old one (e.g. full month over a partial).'),
+        h('p', { style:{ margin:'0 0 8px' } }, h('span', { className:'badge b-green' }, '✓ recd'), ' — this bank line is reconciled: matched to a Jane payout or a payroll payout.'),
+        h('p', { style:{ margin:0 } }, h('span', { className:'badge b-amber' }, 'unmatched'), ' on the Reconcile tab — money that should have moved but can’t be found. Usually a missing statement or a payout still in transit; if it persists for days, investigate.'))),
+    h('div', { className:'sec-h', style:{ marginTop:22 } }, h('h3', null, 'Rules the books follow (so nothing double-counts)')),
+    h('div', { className:'card' },
+      h('div', { className:'muted', style:{ fontSize:12.5, lineHeight:1.7 } },
+        h('p', { style:{ margin:'0 0 8px' } }, '• Revenue comes from Jane reports. Bank deposits categorized “Card revenue (Jane Payments)” stay for balances & reconciliation but are excluded from the P&L.'),
+        h('p', { style:{ margin:'0 0 8px' } }, '• Payroll comes from the payroll dashboard, dated to when each payout was actually sent. Bank lines categorized “Payroll & contractors” are likewise excluded from the P&L.'),
+        h('p', { style:{ margin:'0 0 8px' } }, '• Transfers, owner draws and HST remittances move cash but never touch profit.'),
+        h('p', { style:{ margin:0 } }, '• Amounts are tax-inclusive with the HST portion tracked separately — the Accountant tab’s HST summary nets collected against ITCs (including HST paid to contractors).'))),
+    h('div', { className:'sec-h', style:{ marginTop:22 } }, h('h3', null, 'If something looks wrong')),
+    h('div', { className:'card' },
+      h('div', { className:'muted', style:{ fontSize:12.5, lineHeight:1.7 } },
+        h('p', { style:{ margin:'0 0 8px' } }, '• ', h('b', null, 'Changes not showing after a deploy'), ' — hard-refresh and check the build badge in the footer.'),
+        h('p', { style:{ margin:'0 0 8px' } }, '• ', h('b', null, 'Yellow “cloud setup behind” banner'), ' — run the latest revibe-books-setup.sql (whole file, safe to re-run) in Supabase → SQL Editor, then Sync now.'),
+        h('p', { style:{ margin:'0 0 8px' } }, '• ', h('b', null, 'A PDF won’t convert'), ' — it’s a scanned image; send it to Claude in chat for OCR conversion.'),
+        h('p', { style:{ margin:'0 0 8px' } }, '• ', h('b', null, 'Wrong upload imported'), ' — Transactions → Uploads & documents → × deletes the whole upload cleanly.'),
+        h('p', { style:{ margin:0 } }, '• ', h('b', null, 'Anything else'), ' — describe it to Claude (with a screenshot if visual) and the next build fixes it.'))));
+}
 /* ===================== Cash reconciliation ===================== */
 function ReconcileTab(p) {
   const r = p.recon;
@@ -3459,7 +3536,7 @@ function App() {
   if (!token && showLogin) {
     return h('div', { className:'wrap' }, h(LoginGate, { msg, busy, onLogin:login, onSkip:enterLocal }));
   }
-  const TABS = [['overview','Overview'], ['ledger','Transactions'], ['revenue','Revenue'], ['reconcile','Reconcile'], ['payroll','Payroll'], ['accountant','Accountant'], ['budget','Budget'], ['settings','Settings']];
+  const TABS = [['overview','Overview'], ['ledger','Transactions'], ['revenue','Revenue'], ['reconcile','Reconcile'], ['payroll','Payroll'], ['accountant','Accountant'], ['budget','Budget'], ['settings','Settings'], ['guide','Guide']];
   return h('div', { className:'wrap' },
     h('div', { className:'topbar' },
       h('div', { className:'brand' },
@@ -3489,6 +3566,7 @@ function App() {
     tab === 'accountant' ? h(AccountantTab, { txns, ledger, settings, accounts, payCash }) : null,
     tab === 'budget' ? h(BudgetTab, { txns, buds, ledger, settings, onSetBudget:setBudget, payCash }) : null,
     tab === 'settings' ? h(SettingsTab, { accounts, recs, settings, onSaveAccount:saveAccount, onSaveRecurring:saveRecurring, onDeleteRecurring:deleteRecurring, onSetSettings:setSettingsAll }) : null,
+    tab === 'guide' ? h(GuideTab) : null,
     h('div', { className:'footer' }, 'Revibe Books · fed by the payroll dashboard ledger · bank & Jane CSV imports · accountant-ready exports',
       h('span', { style:{ display:'block', marginTop:6, fontWeight:600, color:'var(--pine)' } }, 'build ' + window.__BUILD)));
 }
