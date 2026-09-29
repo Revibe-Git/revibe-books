@@ -491,7 +491,7 @@ License: MIT
   try{
     if(typeof React==='undefined'||typeof ReactDOM==='undefined') return showError('React failed to initialize.');
     if(typeof Papa==='undefined') return showError('PapaParse failed to initialize.');
-    window.__BUILD='B21';
+    window.__BUILD='B22';
 const h = React.createElement;
 const { useState, useMemo, useRef, useEffect, useCallback } = React;
 /* ---------- formatting ---------- */
@@ -510,7 +510,93 @@ const HST_RATE = 0.13;
 /* extract the HST portion embedded in a tax-inclusive amount */
 const hstIn = amt => round2(amt - amt / (1 + HST_RATE));
 /* ---------- locations & categories ---------- */
-const LOCATIONS = ['Mississauga','Markham','Etobicoke','Shared'];
+/* ---------- portfolios (head office + one per clinic) ----------
+   Every transaction, account and budget line belongs to exactly one portfolio.
+   Head office is the main book and can never be deleted; clinics are added,
+   renamed, staged (pending → buildout → open → closed) and archived from
+   Settings. Transactions store the portfolio NAME, so older books that used
+   "Shared" keep working — it resolves to head office through the alias list. */
+const ENT_KEY = 'rvbk_entities_v1';
+const ENT_STATUS = [
+  { id:'open',     label:'Open',        blurb:'Trading — full revenue and expenses' },
+  { id:'buildout', label:'In buildout', blurb:'Spending capital, not yet earning' },
+  { id:'pending',  label:'Pending',     blurb:'Site not signed — early costs only' },
+  { id:'closed',   label:'Closed',      blurb:'History kept, nothing new booked' }
+];
+const BASE_ENTITIES = [
+  { id:'hq',          name:'Head Office', kind:'head_office', status:'open',     sort:0,  aliases:['Shared','Revibe Head Office','HQ','Head office'] },
+  { id:'mississauga', name:'Mississauga', kind:'clinic',      status:'open',     sort:10 },
+  { id:'markham',     name:'Markham',     kind:'clinic',      status:'open',     sort:20 },
+  { id:'etobicoke',   name:'Etobicoke',   kind:'clinic',      status:'buildout', sort:30 },
+  { id:'oakville',    name:'Oakville',    kind:'clinic',      status:'pending',  sort:40 }
+];
+let ENTITIES = BASE_ENTITIES.slice();
+let LOCATIONS = ENTITIES.map(e => e.name);
+const HQ_ID = 'hq';
+function loadEntities() {
+  const saved = lsGet(ENT_KEY, null);
+  return (saved && saved.length) ? saved : BASE_ENTITIES.slice();
+}
+function rebuildEntities(list) {
+  const arr = (list && list.length ? list : BASE_ENTITIES).slice()
+    .sort((a,b) => (a.sort || 0) - (b.sort || 0));
+  if (!arr.some(e => e.id === HQ_ID)) arr.unshift({ ...BASE_ENTITIES[0] });
+  ENTITIES = arr;
+  LOCATIONS = arr.filter(e => !e.archived).map(e => e.name);
+  return ENTITIES;
+}
+function entityById(id) { return ENTITIES.find(e => e.id === id) || null; }
+/* resolve whatever string a transaction carries to its portfolio */
+function entityByName(raw) {
+  const v = String(raw || '').trim().toLowerCase();
+  if (!v) return null;
+  return ENTITIES.find(e => String(e.name).toLowerCase() === v)
+      || ENTITIES.find(e => (e.aliases || []).some(a => String(a).toLowerCase() === v))
+      || ENTITIES.find(e => String(e.id).toLowerCase() === v) || null;
+}
+const locName = raw => { const e = entityByName(raw); return e ? e.name : String(raw || ''); };
+const entLabel = id => { const e = entityById(id); return e ? e.name : (id || 'Head Office'); };
+/* find a portfolio mentioned inside a free-text cell from an imported file */
+function matchLocText(text) {
+  const lv = String(text || '').toLowerCase();
+  if (!lv.trim()) return null;
+  for (const e of ENTITIES) {
+    const names = [e.name].concat(e.aliases || []);
+    for (const n of names) if (lv.indexOf(String(n).toLowerCase()) > -1) return e.name;
+  }
+  return null;
+}
+function entToRow(e, email) {
+  return { id:e.id, name:e.name || '', kind:e.kind || 'clinic', status:e.status || 'open',
+    sort:e.sort || 0, archived:!!e.archived, aliases:(e.aliases || []).join('|'),
+    updated_at:new Date().toISOString(), updated_by:email || null };
+}
+function entFromRow(r) {
+  return { id:r.id, name:r.name || r.id, kind:r.kind || 'clinic', status:r.status || 'open',
+    sort:parseInt(r.sort, 10) || 0, archived:!!r.archived,
+    aliases:String(r.aliases || '').split('|').filter(Boolean) };
+}
+/* ---------- who can do what ---------- */
+const ROLES = [
+  { id:'owner',      label:'Owner',      rank:4, blurb:'Everything, including who else gets access' },
+  { id:'admin',      label:'Admin',      rank:3, blurb:'Portfolios, accounts and categories, plus all bookkeeping' },
+  { id:'bookkeeper', label:'Bookkeeper', rank:2, blurb:'Imports, entries and reconciliation — no structural changes' },
+  { id:'viewer',     label:'Viewer',     rank:1, blurb:'Reads and exports only' }
+];
+const roleRank = r => { const x = ROLES.find(y => y.id === r); return x ? x.rank : 0; };
+const roleLabel = r => { const x = ROLES.find(y => y.id === r); return x ? x.label : 'Viewer'; };
+const MEM_KEY = 'rvbk_members_v1';
+function permsFor(role) {
+  const n = roleRank(role);
+  return { people:n >= 4, structure:n >= 3, books:n >= 2, view:n >= 1, role };
+}
+function memToRow(m, email) {
+  return { email:String(m.email || '').toLowerCase(), role:m.role || 'viewer', name:m.name || '',
+    updated_at:new Date().toISOString(), updated_by:email || null };
+}
+function memFromRow(r) {
+  return { email:String(r.email || '').toLowerCase(), role:r.role || 'viewer', name:r.name || '' };
+}
 const BASE_CATS = [
   // income
   { id:'jane_deposits',  label:'Card revenue (Jane Payments)',   kind:'income',  hst:true  },
@@ -829,12 +915,30 @@ function txFromRow(r) {
 function accToRow(a, email) {
   return { id:a.id, name:a.name || '', type:a.type || 'bank', anchor_date:a.anchor_date || null,
     anchor_balance:a.anchor_balance || 0, sort:a.sort || 0, archived:!!a.archived,
+    entity:a.entity || HQ_ID, institution:a.institution || '',
     updated_at:new Date().toISOString(), updated_by:email || null };
 }
 function accFromRow(r) {
   return { id:r.id, name:r.name || '', type:r.type || 'bank', anchor_date:r.anchor_date || '',
-    anchor_balance:parseFloat(r.anchor_balance) || 0, sort:r.sort || 0, archived:!!r.archived };
+    anchor_balance:parseFloat(r.anchor_balance) || 0, sort:r.sort || 0, archived:!!r.archived,
+    entity:r.entity || HQ_ID, institution:r.institution || '' };
 }
+const ACC_TYPES = [
+  { id:'bank',      label:'Bank account',      blurb:'Chequing or savings — holds cash' },
+  { id:'credit',    label:'Credit card',       blurb:'Balance owing, not cash on hand' },
+  { id:'loan',      label:'Loan / financing',  blurb:'Equipment financing, term loan or line of credit' },
+  { id:'processor', label:'Payment processor', blurb:'Jane Payments, AMEX, eClaims — money in transit to a bank account' }
+];
+const accTypeLabel = t => { const x = ACC_TYPES.find(y => y.id === t); return x ? x.label : 'Bank account'; };
+/* the accounts Revibe actually runs on — offered as a one-click setup while the list is empty */
+const SEED_ACCOUNTS = [
+  { name:'RBC 5299 — Head Office',      type:'bank',   entity:'hq',          institution:'RBC' },
+  { name:'RBC 5201 — Mississauga',      type:'bank',   entity:'mississauga', institution:'RBC' },
+  { name:'RBC 6385 — Markham',          type:'bank',   entity:'markham',     institution:'RBC' },
+  { name:'RBC 8629/4047 Visa',          type:'credit', entity:'hq',          institution:'RBC' },
+  { name:'CIBC 9016 Mastercard',        type:'credit', entity:'hq',          institution:'CIBC' },
+  { name:'CIBC 1132 — Equipment',       type:'loan',   entity:'hq',          institution:'CIBC' }
+];
 function recToRow(x, email) {
   return { id:x.id, description:x.description || '', category:x.category || null, location:x.location || null,
     kind:x.kind || 'expense', amount:x.amount || 0, hst:x.hst || 0, frequency:x.frequency || 'monthly',
@@ -1058,8 +1162,7 @@ function normalizeBankCsv(res) {
     const desc = String((cols.descCol ? r[cols.descCol] : '') || '').trim().replace(/\s+/g,' ');
     const row = { date, description:desc || '(no description)', amount:round2(amt) };
     if (locCol) {
-      const lv = String(r[locCol] || '').toLowerCase();
-      const match = LOCATIONS.find(L => lv.indexOf(L.toLowerCase()) > -1);
+      const match = matchLocText(r[locCol]);
       if (match) row.location = match;
     }
     if (catCol) {
@@ -1637,7 +1740,7 @@ function guessJaneYear(monthly) {
 function buildJaneMonthlyRows(monthly, year, defLoc, defAcc, existingHashes) {
   const rows = [];
   monthly.blocks.forEach(b => {
-    const loc = LOCATIONS.find(l => (b.location || '').toLowerCase().indexOf(l.toLowerCase()) > -1) || defLoc;
+    const loc = matchLocText(b.location) || defLoc;
     b.months.forEach(mm => {
       const t = { id:uid(), date:monthEndIso(year, mm.month),
         description:'Jane processing fees — ' + MONTHS[mm.month - 1] + ' ' + year + (mm.n ? ' (' + mm.n + ' transactions on ' + money(mm.gross) + ')' : ''),
@@ -1661,7 +1764,7 @@ function rollup(txns, opts) {
     if (o.month && ym(t.date) !== o.month) return;
     if (o.months && o.months.indexOf(ym(t.date)) === -1) return;
     if (o.year && (t.date||'').slice(0,4) !== o.year) return;
-    if (o.location && o.location !== 'all' && t.location !== o.location) return;
+    if (o.location && o.location !== 'all' && locName(t.location) !== o.location) return;
     if (o.skipCat && o.skipCat[t.category]) return;
     // when revenue is booked from Jane reports, bank deposit lines are the same
     // money arriving — keep them for balances & reconciliation, not the P&L
@@ -2295,6 +2398,7 @@ function ImportPanel(p) {
 /* ===================== Ledger (transactions) ===================== */
 const blankTx = () => ({ id:'', date:todayIso(), description:'', category:'', location:'Shared', kind:'expense', amount:'', hst:'', account_id:'', source:'manual' });
 function LedgerTab(p) {
+  const canBooks = !p.can || p.can.books !== false;
   const [view, setView] = useState('uploads');
   const [openBatch, setOpenBatch] = useState(null);
   const [showImport, setShowImport] = useState(false);
@@ -2313,7 +2417,7 @@ function LedgerTab(p) {
   }, [p.txns]);
   const list = useMemo(() => p.txns.filter(t =>
       (fMonth === 'all' || ym(t.date) === fMonth) &&
-      (fLoc === 'all' || t.location === fLoc) &&
+      (fLoc === 'all' || locName(t.location) === fLoc) &&
       (fCat === 'all' || t.category === fCat) &&
       (!q.trim() || ((t.description || '') + ' ' + (t.vendor || '') + ' ' + (t.notes || '') + ' ' + catLabel(t.category)).toLowerCase().includes(q.trim().toLowerCase())))
     .slice().sort((a,b) => (b.date||'').localeCompare(a.date||'') || (b.id||'').localeCompare(a.id||'')), [p.txns, fMonth, fLoc, fCat, q]);
@@ -2401,8 +2505,9 @@ function LedgerTab(p) {
       h('button', { className:'ghost' + (view === 'uploads' ? ' primary' : ''), onClick:() => setView('uploads') }, '🗂 Uploads & documents'),
       h('button', { className:'ghost' + (view === 'all' ? ' primary' : ''), onClick:() => setView('all') }, 'All transactions'),
       h('span', { style:{ flex:1 } }),
-      h('button', { className:'ghost' + (showImport ? ' primary' : ''), onClick:() => setShowImport(v => !v), style:{ padding:'8px 14px' } }, showImport ? 'Hide import' : '⬆ Import file'),
-      h('button', { className:'ghost primary', onClick:() => setAdding(v => !v), style:{ padding:'8px 14px' } }, adding ? 'Close' : '+ Add entry')),
+      canBooks ? h('button', { className:'ghost' + (showImport ? ' primary' : ''), onClick:() => setShowImport(v => !v), style:{ padding:'8px 14px' } }, showImport ? 'Hide import' : '⬆ Import file') : null,
+      canBooks ? h('button', { className:'ghost primary', onClick:() => setAdding(v => !v), style:{ padding:'8px 14px' } }, adding ? 'Close' : '+ Add entry')
+        : h('span', { className:'badge b-purple', title:'Viewer access — you can read and export everything, but not change the books' }, 'view only')),
     showImport ? h(ImportPanel, { txns:p.txns, accounts:p.accounts,
       onImport:(rows, meta) => { p.onSave(rows, meta); setShowImport(false); setView('uploads'); if (meta) setOpenBatch(meta.id); },
       onUpdateAR:(rows, fn) => { p.onUpdateAR(rows, fn); setShowImport(false); },
@@ -2727,6 +2832,21 @@ function GuideTab() {
         h('p', { style:{ margin:'0 0 8px' } }, h('span', { className:'badge b-amber' }, 'already imported'), ' — duplicate protection; the line is skipped. ', h('span', { className:'badge b-purple' }, 'updates existing'), ' — a refreshed figure replaces the old one (e.g. full month over a partial).'),
         h('p', { style:{ margin:'0 0 8px' } }, h('span', { className:'badge b-green' }, '✓ recd'), ' — this bank line is reconciled: matched to a Jane payout or a payroll payout.'),
         h('p', { style:{ margin:0 } }, h('span', { className:'badge b-amber' }, 'unmatched'), ' on the Reconcile tab — money that should have moved but can’t be found. Usually a missing statement or a payout still in transit; if it persists for days, investigate.'))),
+    h('div', { className:'sec-h', style:{ marginTop:22 } }, h('h3', null, 'Portfolios — where everything gets attributed')),
+    h('div', { className:'card' },
+      h('div', { className:'muted', style:{ fontSize:12.5, lineHeight:1.7 } },
+        h('p', { style:{ margin:'0 0 8px' } }, '• ', h('b', null, 'Head Office'), ' is the main book. It holds the corporate accounts and the costs that belong to the whole company rather than one clinic — software, insurance, accounting and legal, brand marketing.'),
+        h('p', { style:{ margin:'0 0 8px' } }, '• Each clinic is its own portfolio with its own bank accounts, cards and payment processors. Every account belongs to exactly one portfolio, so anything imported from that account is attributed there automatically — you only tag a line by hand when it is an exception.'),
+        h('p', { style:{ margin:'0 0 8px' } }, '• A portfolio that is not trading yet is marked ', h('b', null, 'Pending'), ' (site not signed) or ', h('b', null, 'In buildout'), '. It stays out of the P&L columns until something is actually booked to it, so a location under construction never reads as an underperforming clinic.'),
+        h('p', { style:{ margin:0 } }, '• Books started before portfolios existed used “Shared” for company-wide costs — those lines resolve to Head Office automatically. Nothing needs re-tagging.'))),
+    h('div', { className:'sec-h', style:{ marginTop:22 } }, h('h3', null, 'Who can change what')),
+    h('div', { className:'card' },
+      h('div', { className:'muted', style:{ fontSize:12.5, lineHeight:1.7 } },
+        h('p', { style:{ margin:'0 0 8px' } }, '• ', h('b', null, 'Owner'), ' — everything, including who else gets access.'),
+        h('p', { style:{ margin:'0 0 8px' } }, '• ', h('b', null, 'Admin'), ' — adds and edits portfolios, accounts and categories, plus all bookkeeping.'),
+        h('p', { style:{ margin:'0 0 8px' } }, '• ', h('b', null, 'Bookkeeper'), ' — imports, entries and reconciliation. Cannot change portfolios, accounts or the chart of accounts.'),
+        h('p', { style:{ margin:'0 0 8px' } }, '• ', h('b', null, 'Viewer'), ' — reads and exports everything, changes nothing.'),
+        h('p', { style:{ margin:0 } }, 'Access is set in Settings → People & access, per email address. Everyone signs in with their own Revibe account — never share a login, because every change records who made it.'))),
     h('div', { className:'sec-h', style:{ marginTop:22 } }, h('h3', null, 'Rules the books follow (so nothing double-counts)')),
     h('div', { className:'card' },
       h('div', { className:'muted', style:{ fontSize:12.5, lineHeight:1.7 } },
@@ -2939,6 +3059,13 @@ function ARSection(p) {
 }
 /* ===================== Accountant view ===================== */
 function AccountantTab(p) {
+  /* a portfolio earns a column once it has activity; pending sites and closed
+     clinics stay out of the report until something is actually booked to them */
+  const COLS = useMemo(() => LOCATIONS.filter(l => {
+    const e = entityByName(l);
+    if (!e || (e.status !== 'pending' && e.status !== 'closed')) return true;
+    return (p.txns || []).some(t => locName(t.location) === l);
+  }), [p.txns]);
   const { txns, ledger, settings, payCash } = p;
   const useCash = settings.payrollTiming !== 'period' && payCash && payCash.hasData;
   const pbmAcc = useMemo(() => payrollByMonth(ledger), [ledger]);
@@ -2969,7 +3096,7 @@ function AccountantTab(p) {
   const perLoc = useMemo(() => {
     const m = {};
     const g = { skipBankJaneDeposits:settings.revenueSource !== 'bank' };
-    LOCATIONS.forEach(l => { m[l] = rollup(txns, { ...opts, ...g, location:l, skipCat:skip }); });
+    COLS.forEach(l => { m[l] = rollup(txns, { ...opts, ...g, location:l, skipCat:skip }); });
     m.__all = rollup(txns, { ...opts, ...g, skipCat:skip });
     return m;
   }, [txns, period, settings.payrollSource]);
@@ -2986,7 +3113,7 @@ function AccountantTab(p) {
     const ids = CATS.filter(c => c.kind === kind).map(c => c.id);
     const rows = [];
     ids.forEach(id => {
-      const cells = LOCATIONS.map(l => (perLoc[l].byCat[id] && perLoc[l].byCat[id].amt) || 0);
+      const cells = COLS.map(l => (perLoc[l].byCat[id] && perLoc[l].byCat[id].amt) || 0);
       const tot = (all.byCat[id] && all.byCat[id].amt) || 0;
       if (tot || cells.some(Boolean)) rows.push({ id, label:catLabel(id), cells, tot });
     });
@@ -2994,9 +3121,9 @@ function AccountantTab(p) {
     Object.keys(all.byCat).forEach(id => {
       if (ids.includes(id) || (all.byCat[id].kind !== kind)) return;
       if (catById(id)) return;
-      rows.push({ id, label:id || 'Uncategorized', cells:LOCATIONS.map(l => (perLoc[l].byCat[id] && perLoc[l].byCat[id].amt) || 0), tot:all.byCat[id].amt });
+      rows.push({ id, label:id || 'Uncategorized', cells:COLS.map(l => (perLoc[l].byCat[id] && perLoc[l].byCat[id].amt) || 0), tot:all.byCat[id].amt });
     });
-    if (kind === 'expense' && skip && payAmt.net) rows.push({ id:'payroll_auto', label:'Payroll & contractors (payroll dashboard)', cells:LOCATIONS.map(() => 0), tot:payAmt.net, note:'not split by location' });
+    if (kind === 'expense' && skip && payAmt.net) rows.push({ id:'payroll_auto', label:'Payroll & contractors (payroll dashboard)', cells:COLS.map(() => 0), tot:payAmt.net, note:'not split by location' });
     rows.sort((a,b) => b.tot - a.tot);
     return rows;
   };
@@ -3015,14 +3142,14 @@ function AccountantTab(p) {
     out.push(line(['Prepared with', 'Revibe Books dashboard']));
     out.push('');
     out.push(line(['PROFIT & LOSS — ' + label.toUpperCase()]));
-    out.push(line(['Line', ...LOCATIONS, 'Total']));
+    out.push(line(['Line', ...COLS, 'Total']));
     out.push(line(['— Income —']));
     incRows.forEach(r => out.push(line([r.label, ...r.cells.map(n2), n2(r.tot)])));
-    out.push(line(['Total income', ...LOCATIONS.map(l => n2(perLoc[l].income)), n2(all.income)]));
+    out.push(line(['Total income', ...COLS.map(l => n2(perLoc[l].income)), n2(all.income)]));
     out.push(line(['— Expenses —']));
     expRows.forEach(r => out.push(line([r.label, ...r.cells.map(n2), n2(r.tot)])));
-    out.push(line(['Total expenses', ...LOCATIONS.map(l => n2(perLoc[l].expense)), n2(totalExp)]));
-    out.push(line(['NET PROFIT / (LOSS)', ...LOCATIONS.map(l => n2(perLoc[l].income - perLoc[l].expense)), n2(netProfit)]));
+    out.push(line(['Total expenses', ...COLS.map(l => n2(perLoc[l].expense)), n2(totalExp)]));
+    out.push(line(['NET PROFIT / (LOSS)', ...COLS.map(l => n2(perLoc[l].income - perLoc[l].expense)), n2(netProfit)]));
     out.push('');
     out.push(line(['HST SUMMARY — ' + label.toUpperCase()]));
     out.push(line(['HST collected on sales', n2(all.hstCollected)]));
@@ -3070,17 +3197,17 @@ function AccountantTab(p) {
       h('div', { className:'eyebrow', style:{ marginBottom:8 } }, 'Profit & loss — ' + label + ' · by location'),
       h('div', { style:{ overflowX:'auto' } },
         h('table', null,
-          h('thead', null, h('tr', null, h('th', null, ''), ...LOCATIONS.map(l => h('th', { className:'r', key:l }, l)), h('th', { className:'r' }, 'Total'))),
+          h('thead', null, h('tr', null, h('th', null, ''), ...COLS.map(l => h('th', { className:'r', key:l }, l)), h('th', { className:'r' }, 'Total'))),
           h('tbody', null,
-            h('tr', null, h('td', { colSpan:LOCATIONS.length + 2, style:{ fontWeight:700, color:'var(--teal-ink)', background:'var(--surface-2)' } }, 'Income')),
+            h('tr', null, h('td', { colSpan:COLS.length + 2, style:{ fontWeight:700, color:'var(--teal-ink)', background:'var(--surface-2)' } }, 'Income')),
             incRows.map(r => h('tr', { key:r.id }, h('td', null, r.label), ...r.cells.map((v,i) => cell(v)), cell(r.tot, true))),
-            h('tr', null, h('td', { style:{ fontWeight:700 } }, 'Total income'), ...LOCATIONS.map(l => cell(perLoc[l].income, true)), cell(all.income, true)),
-            h('tr', null, h('td', { colSpan:LOCATIONS.length + 2, style:{ fontWeight:700, color:'var(--coral)', background:'var(--surface-2)' } }, 'Expenses')),
+            h('tr', null, h('td', { style:{ fontWeight:700 } }, 'Total income'), ...COLS.map(l => cell(perLoc[l].income, true)), cell(all.income, true)),
+            h('tr', null, h('td', { colSpan:COLS.length + 2, style:{ fontWeight:700, color:'var(--coral)', background:'var(--surface-2)' } }, 'Expenses')),
             expRows.map(r => h('tr', { key:r.id }, h('td', null, r.label, r.note ? h('span', { className:'dim', style:{ fontSize:10.5, marginLeft:6 } }, r.note) : null),
               ...r.cells.map((v,i) => cell(v)), cell(r.tot, true))),
-            h('tr', null, h('td', { style:{ fontWeight:700 } }, 'Total expenses'), ...LOCATIONS.map(l => cell(perLoc[l].expense, true)), cell(totalExp, true)),
+            h('tr', null, h('td', { style:{ fontWeight:700 } }, 'Total expenses'), ...COLS.map(l => cell(perLoc[l].expense, true)), cell(totalExp, true)),
             h('tr', { style:{ background:'var(--teal-bg)' } }, h('td', { style:{ fontWeight:800 } }, 'Net profit / (loss)'),
-              ...LOCATIONS.map(l => cell(round2(perLoc[l].income - perLoc[l].expense), true)), cell(netProfit, true)))))),
+              ...COLS.map(l => cell(round2(perLoc[l].income - perLoc[l].expense), true)), cell(netProfit, true)))))),
     h('div', { className:'dim', style:{ fontSize:11.5, lineHeight:1.6 } },
       'Notes for the accountant: amounts are tax-inclusive with the embedded HST shown separately in the HST summary; ',
       'payroll comes from the payroll dashboard’s saved runs (contractor invoices, incl. HST where registered), dated ' + (useCash ? 'to the day each payout was actually sent (cash basis)' : 'to the pay-period end') + ', and is not split by location; ',
@@ -3170,6 +3297,29 @@ function SettingsTab(p) {
   const [accDraft, setAccDraft] = useState(null);
   const [recDraft, setRecDraft] = useState(null);
   const [catDraft, setCatDraft] = useState(null);
+  const [entDraft, setEntDraft] = useState(null);
+  const [memDraft, setMemDraft] = useState(null);
+  const can = p.can || { structure:true, people:true, books:true };
+  const saveEnt = () => {
+    if (!entDraft.name || !entDraft.name.trim()) { window.alert('Give the portfolio a name.'); return; }
+    p.onSaveEntity({ ...entDraft, name:entDraft.name.trim() }); setEntDraft(null);
+  };
+  const saveMem = () => {
+    const em = String(memDraft.email || '').trim().toLowerCase();
+    if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(em)) { window.alert('Enter a valid email address.'); return; }
+    p.onSaveMember({ email:em, role:memDraft.role || 'viewer', name:(memDraft.name || '').trim() });
+    setMemDraft(null);
+  };
+  /* live balance per account — anchor plus everything booked to it since */
+  const balOf = a => {
+    let bal = a.anchor_balance || 0;
+    (p.txns || []).forEach(t => {
+      if (t.account_id !== a.id) return;
+      if (a.anchor_date && t.date && t.date <= a.anchor_date) return;
+      bal += (t.kind === 'income' ? 1 : -1) * (t.amount || 0);
+    });
+    return round2(bal);
+  };
   const saveCat = () => {
     if (!catDraft.label || !catDraft.label.trim()) { window.alert('Give the category a name.'); return; }
     if (catDraft.id) p.onUpdCat(catDraft.id, { label:catDraft.label.trim(), hst:!!catDraft.hst });
@@ -3178,7 +3328,8 @@ function SettingsTab(p) {
   };
   const saveAcc = () => {
     if (!accDraft.name.trim()) { window.alert('Give the account a name.'); return; }
-    const a = { ...accDraft, id:accDraft.id || uid(), anchor_balance:parseFloat(accDraft.anchor_balance) || 0 };
+    const a = { ...accDraft, id:accDraft.id || uid(), entity:accDraft.entity || HQ_ID,
+      anchor_balance:parseFloat(accDraft.anchor_balance) || 0 };
     p.onSaveAccount(a); setAccDraft(null);
   };
   const saveRec = () => {
@@ -3190,32 +3341,113 @@ function SettingsTab(p) {
     p.onSaveRecurring(x); setRecDraft(null);
   };
   return h('div', null,
-    h('div', { className:'sec' },
-      h('div', { className:'sec-h' }, h('h3', null, 'Bank accounts & cards'),
-        h('button', { className:'ghost primary', style:{ padding:'6px 14px', fontSize:12 },
-          onClick:() => setAccDraft({ id:'', name:'', type:'bank', anchor_date:todayIso(), anchor_balance:'' }) }, '+ Add account')),
-      h('p', { className:'dim', style:{ fontSize:12.5, margin:'0 0 12px', maxWidth:640, lineHeight:1.55 } },
-        'Set each account’s balance as of a date (straight off your banking app). From then on, every imported or entered transaction moves the balance — so the dashboard always knows exactly how much money you have.'),
-      accDraft ? h('div', { className:'card', style:{ marginBottom:10, border:'1px solid var(--teal)' } },
+    h('div', { className:'sec', id:'portfolios' },
+      h('div', { className:'sec-h' }, h('h3', null, 'Portfolios & accounts'),
+        can.structure ? h('div', { style:{ display:'flex', gap:8 } },
+          h('button', { className:'ghost', style:{ padding:'6px 13px', fontSize:12 },
+            onClick:() => setEntDraft({ id:'', name:'', kind:'clinic', status:'pending', sort:(ENTITIES.length + 1) * 10 }) }, '+ Add portfolio'),
+          h('button', { className:'ghost primary', style:{ padding:'6px 13px', fontSize:12 },
+            onClick:() => setAccDraft({ id:'', name:'', type:'bank', entity:HQ_ID, institution:'', anchor_date:todayIso(), anchor_balance:'' }) }, '+ Add account')) : null),
+      h('p', { className:'dim', style:{ fontSize:12.5, margin:'0 0 12px', maxWidth:700, lineHeight:1.55 } },
+        'Head Office is the main book; each clinic is its own portfolio underneath it. Every account — bank, card, financing or payment processor — belongs to exactly one portfolio, so anything imported from that account is attributed there automatically. Set each account’s balance as of a date straight off your banking app, and every transaction after it moves the balance from there.'),
+      entDraft ? h('div', { className:'card', style:{ marginBottom:10, border:'1px solid var(--teal)' } },
+        h('div', { style:{ fontWeight:600, fontSize:13, marginBottom:8 } }, entDraft.id ? 'Edit portfolio' : 'New portfolio'),
         h('div', { style:{ display:'flex', gap:8, flexWrap:'wrap', alignItems:'flex-end' } },
-          h(Fld, { label:'Name', value:accDraft.name, onChange:v => setAccDraft({ ...accDraft, name:v }), placeholder:'e.g. RBC Chequing — Mississauga', flex:2, min:200 }),
-          h(Fld, { label:'Type', select:true, value:accDraft.type, onChange:v => setAccDraft({ ...accDraft, type:v }), flex:'0 0 130px',
-            children:[h('option', { value:'bank' }, 'Bank account'), h('option', { value:'credit' }, 'Credit card')] }),
+          h(Fld, { label:'Name', value:entDraft.name, onChange:v => setEntDraft({ ...entDraft, name:v }), placeholder:'e.g. Oakville', flex:2, min:200 }),
+          h(Fld, { label:'Type', select:true, value:entDraft.kind, onChange:v => setEntDraft({ ...entDraft, kind:v }), flex:'0 0 150px',
+            children:[h('option', { value:'clinic' }, 'Clinic'), h('option', { value:'head_office' }, 'Head office')] }),
+          h(Fld, { label:'Stage', select:true, value:entDraft.status, onChange:v => setEntDraft({ ...entDraft, status:v }), flex:'0 0 160px',
+            children:ENT_STATUS.map(x => h('option', { key:x.id, value:x.id }, x.label)) })),
+        h('p', { className:'dim', style:{ fontSize:12, margin:'9px 0 0', lineHeight:1.5 } },
+          (ENT_STATUS.find(x => x.id === entDraft.status) || {}).blurb || ''),
+        h('div', { style:{ display:'flex', justifyContent:'flex-end', gap:8, marginTop:10 } },
+          h('button', { className:'ghost', onClick:() => setEntDraft(null) }, 'Cancel'),
+          h('button', { className:'ghost primary', onClick:saveEnt }, entDraft.id ? 'Save portfolio' : 'Add portfolio'))) : null,
+      accDraft ? h('div', { className:'card', style:{ marginBottom:10, border:'1px solid var(--teal)' } },
+        h('div', { style:{ fontWeight:600, fontSize:13, marginBottom:8 } }, accDraft.id ? 'Edit account' : 'New account'),
+        h('div', { style:{ display:'flex', gap:8, flexWrap:'wrap', alignItems:'flex-end' } },
+          h(Fld, { label:'Name', value:accDraft.name, onChange:v => setAccDraft({ ...accDraft, name:v }), placeholder:'e.g. RBC 5201 — Mississauga', flex:2, min:210 }),
+          h(Fld, { label:'Portfolio', select:true, value:accDraft.entity || HQ_ID, onChange:v => setAccDraft({ ...accDraft, entity:v }), flex:'0 0 160px',
+            children:ENTITIES.filter(e => !e.archived).map(e => h('option', { key:e.id, value:e.id }, e.name)) }),
+          h(Fld, { label:'Type', select:true, value:accDraft.type, onChange:v => setAccDraft({ ...accDraft, type:v }), flex:'0 0 165px',
+            children:ACC_TYPES.map(x => h('option', { key:x.id, value:x.id }, x.label)) }),
           h(Fld, { label:'Balance as of', type:'date', value:accDraft.anchor_date, onChange:v => setAccDraft({ ...accDraft, anchor_date:v }), flex:'0 0 150px' }),
           h(Fld, { label:'Balance $', value:accDraft.anchor_balance, onChange:v => setAccDraft({ ...accDraft, anchor_balance:v }), right:true, flex:'0 0 120px', placeholder:'0.00' })),
+        h('p', { className:'dim', style:{ fontSize:12, margin:'9px 0 0', lineHeight:1.5 } },
+          (ACC_TYPES.find(x => x.id === accDraft.type) || {}).blurb || ''),
         h('div', { style:{ display:'flex', justifyContent:'flex-end', gap:8, marginTop:10 } },
           h('button', { className:'ghost', onClick:() => setAccDraft(null) }, 'Cancel'),
-          h('button', { className:'ghost primary', onClick:saveAcc }, 'Save account'))) : null,
-      p.accounts.filter(a => !a.archived).map(a => h('div', { className:'row', key:a.id },
-        h('span', { className:'pill ' + (a.type === 'credit' ? 'b-amber' : 'b-teal') }, a.type === 'credit' ? 'CC' : '$'),
-        h('div', { className:'rmain' },
-          h('div', { className:'rt' }, a.name),
-          h('div', { className:'rs' }, (a.type === 'credit' ? 'Credit card' : 'Bank account') + ' · anchored ' + money(a.anchor_balance) + ' on ' + (a.anchor_date || '—'))),
-        h('button', { className:'ghost', style:{ padding:'4px 10px', fontSize:12 }, onClick:() => setAccDraft({ ...a }) }, 'Edit'),
-        h('button', { className:'ghost', style:{ padding:'4px 10px', fontSize:12, color:'var(--red)' },
-          onClick:() => { if (window.confirm('Remove ' + a.name + '? Its transactions stay in the books.')) p.onSaveAccount({ ...a, archived:true }); } }, '×'))),
-      !p.accounts.filter(a => !a.archived).length && !accDraft ? h('div', { className:'card', style:{ padding:20, textAlign:'center' } },
-        h('p', { className:'dim', style:{ margin:0 } }, 'No accounts yet — add your operating account to unlock the live cash position.')) : null),
+          h('button', { className:'ghost primary', onClick:saveAcc }, accDraft.id ? 'Save account' : 'Add account'))) : null,
+      !p.accounts.filter(a => !a.archived).length && !accDraft && can.structure
+        ? h('div', { className:'card', style:{ padding:18, textAlign:'center', marginBottom:10 } },
+            h('p', { className:'dim', style:{ margin:'0 0 10px', fontSize:12.5, lineHeight:1.55 } },
+              'No accounts yet. Add Revibe’s six accounts in one click — you can rename them, move them between portfolios or set opening balances afterwards.'),
+            h('button', { className:'ghost primary', onClick:p.onSeedAccounts }, 'Add our six accounts')) : null,
+      ENTITIES.filter(e => !e.archived).map(e => {
+        const accs = p.accounts.filter(a => !a.archived && (a.entity || HQ_ID) === e.id);
+        const cash = round2(accs.filter(a => a.type === 'bank' || a.type === 'processor').reduce((x,a) => x + balOf(a), 0));
+        const owing = round2(accs.filter(a => a.type === 'credit' || a.type === 'loan').reduce((x,a) => x + Math.min(0, balOf(a)), 0));
+        const st = ENT_STATUS.find(x => x.id === (e.status || 'open')) || ENT_STATUS[0];
+        return h('div', { key:e.id, className:'card', style:{ marginBottom:10, padding:'13px 15px' } },
+          h('div', { style:{ display:'flex', alignItems:'center', gap:9, flexWrap:'wrap', marginBottom:accs.length ? 8 : 0 } },
+            h('span', { style:{ fontFamily:'var(--display)', fontWeight:700, fontSize:14, letterSpacing:'.02em' } }, e.name),
+            e.kind === 'head_office' ? h('span', { className:'badge b-teal', style:{ fontSize:10 } }, 'main book') : null,
+            h('span', { className:'badge ' + (e.status === 'open' ? 'b-green' : e.status === 'closed' ? 'b-red' : 'b-amber'), style:{ fontSize:10 } }, st.label),
+            h('span', { className:'dim', style:{ fontSize:11.5, marginLeft:'auto' } },
+              accs.length ? (money(cash) + ' cash' + (owing ? ' · ' + money(Math.abs(owing)) + ' owing' : '')) : 'no accounts'),
+            can.structure ? h('button', { className:'ghost', style:{ padding:'3px 9px', fontSize:11.5 },
+              onClick:() => setEntDraft({ ...e }) }, 'Edit') : null,
+            can.structure && e.kind !== 'head_office' ? h('button', { className:'ghost', style:{ padding:'3px 9px', fontSize:11.5, color:'var(--red)' },
+              onClick:() => p.onArchiveEntity(e) }, '×') : null),
+          accs.map(a => h('div', { className:'row', key:a.id, style:{ paddingLeft:2 } },
+            h('span', { className:'pill ' + (a.type === 'credit' ? 'b-amber' : a.type === 'loan' ? 'b-red' : a.type === 'processor' ? 'b-purple' : 'b-teal') },
+              a.type === 'credit' ? 'CC' : a.type === 'loan' ? 'LN' : a.type === 'processor' ? 'PP' : '$'),
+            h('div', { className:'rmain' },
+              h('div', { className:'rt' }, a.name),
+              h('div', { className:'rs' }, accTypeLabel(a.type) + ' · anchored ' + money(a.anchor_balance) + ' on ' + (a.anchor_date || '—'))),
+            h('div', { className:'ramt num' }, money(balOf(a))),
+            can.structure ? h('button', { className:'ghost', style:{ padding:'4px 10px', fontSize:12 }, onClick:() => setAccDraft({ ...a }) }, 'Edit') : null,
+            can.structure ? h('button', { className:'ghost', style:{ padding:'4px 10px', fontSize:12, color:'var(--red)' },
+              onClick:() => { if (window.confirm('Remove ' + a.name + '? Its transactions stay in the books.')) p.onSaveAccount({ ...a, archived:true }); } }, '×') : null)));
+      }),
+      !can.structure ? h('p', { className:'dim', style:{ fontSize:12, margin:'4px 2px 0' } },
+        'Your access level can view portfolios and accounts but not change them — ask an owner or admin for Admin access.') : null),
+    h('div', { className:'sec', id:'people' },
+      h('div', { className:'sec-h' }, h('h3', null, 'People & access'),
+        can.people ? h('button', { className:'ghost primary', style:{ padding:'6px 14px', fontSize:12 },
+          onClick:() => setMemDraft({ email:'', role:'bookkeeper', name:'' }) }, '+ Add person') : null),
+      h('p', { className:'dim', style:{ fontSize:12.5, margin:'0 0 12px', maxWidth:700, lineHeight:1.55 } },
+        'Who can do what in the books. Everyone signs in with their own Revibe account — this list decides what they can change once they are in.'),
+      h('div', { className:'card', style:{ marginBottom:10, padding:'11px 14px' } },
+        ROLES.slice().sort((a,b) => b.rank - a.rank).map(r => h('div', { key:r.id, style:{ display:'flex', gap:9, alignItems:'baseline', fontSize:12.5, padding:'3px 0' } },
+          h('span', { style:{ fontWeight:650, minWidth:92 } }, r.label),
+          h('span', { className:'dim', style:{ lineHeight:1.5 } }, r.blurb)))),
+      !(p.members || []).length ? h('div', { className:'warnbox', style:{ marginBottom:10 } }, h('span', null, '⚠'),
+        h('span', null, h('b', null, 'Nobody is listed yet. '),
+          'While this list is empty, anyone who can sign in has full access. Add yourself as Owner first, then everyone else — the moment there is one Owner, the rules below apply.')) : null,
+      memDraft ? h('div', { className:'card', style:{ marginBottom:10, border:'1px solid var(--teal)' } },
+        h('div', { style:{ display:'flex', gap:8, flexWrap:'wrap', alignItems:'flex-end' } },
+          h(Fld, { label:'Email', value:memDraft.email, onChange:v => setMemDraft({ ...memDraft, email:v }), placeholder:'name@revibeto.com', flex:2, min:200 }),
+          h(Fld, { label:'Name (optional)', value:memDraft.name, onChange:v => setMemDraft({ ...memDraft, name:v }), placeholder:'e.g. Justice', flex:1.2, min:150 }),
+          h(Fld, { label:'Access', select:true, value:memDraft.role, onChange:v => setMemDraft({ ...memDraft, role:v }), flex:'0 0 160px',
+            children:ROLES.slice().sort((a,b) => b.rank - a.rank).map(r => h('option', { key:r.id, value:r.id }, r.label)) })),
+        h('div', { style:{ display:'flex', justifyContent:'flex-end', gap:8, marginTop:10 } },
+          h('button', { className:'ghost', onClick:() => setMemDraft(null) }, 'Cancel'),
+          h('button', { className:'ghost primary', onClick:saveMem }, 'Save person'))) : null,
+      (p.members || []).slice().sort((a,b) => roleRank(b.role) - roleRank(a.role) || a.email.localeCompare(b.email)).map(m =>
+        h('div', { className:'row', key:m.email },
+          h('span', { className:'pill ' + (m.role === 'owner' ? 'b-green' : m.role === 'admin' ? 'b-teal' : m.role === 'bookkeeper' ? 'b-amber' : 'b-purple') },
+            roleLabel(m.role).slice(0,2).toUpperCase()),
+          h('div', { className:'rmain' },
+            h('div', { className:'rt' }, m.name || m.email,
+              String(m.email).toLowerCase() === String(p.myEmail || '').toLowerCase()
+                ? h('span', { className:'badge b-teal', style:{ marginLeft:8, fontSize:10 } }, 'you') : null),
+            h('div', { className:'rs' }, (m.name ? m.email + ' · ' : '') + roleLabel(m.role))),
+          can.people ? h('button', { className:'ghost', style:{ padding:'4px 10px', fontSize:12 }, onClick:() => setMemDraft({ ...m }) }, 'Edit') : null,
+          can.people ? h('button', { className:'ghost', style:{ padding:'4px 10px', fontSize:12, color:'var(--red)' },
+            onClick:() => p.onDeleteMember(m) }, '×') : null)),
+      !can.people ? h('p', { className:'dim', style:{ fontSize:12, margin:'4px 2px 0' } },
+        'Only an owner can change who has access. You are signed in as ' + (p.myEmail || 'a local user') + ' with ' + roleLabel(can.role) + ' access.') : null),
     h('div', { className:'sec' },
       h('div', { className:'sec-h' }, h('h3', null, 'Recurring bills'),
         h('button', { className:'ghost primary', style:{ padding:'6px 14px', fontSize:12 },
@@ -3335,7 +3567,52 @@ function App() {
       return next;
     });
   };
+  const [entities, setEntities] = useState(() => rebuildEntities(loadEntities()));
+  const [members, setMembers] = useState(() => lsGet(MEM_KEY, []));
   const [catStore, setCatStore] = useState(loadCatStore);
+  const saveEntities = (list, changed) => {
+    const next = rebuildEntities(list).slice();
+    lsSet(ENT_KEY, next);
+    setEntities(next);
+    if (changed && changed.length) cloudWrite('bk_entities', changed.map(e => entToRow(e, user)));
+  };
+  const saveEntity = e => {
+    const id = e.id || ('e_' + String(e.name).toLowerCase().replace(/[^a-z0-9]+/g,'_').replace(/^_+|_+$/g,'').slice(0,28) || uid());
+    const row = { ...e, id, sort:e.sort != null ? e.sort : (entities.length + 1) * 10 };
+    const exists = entities.some(x => x.id === id);
+    saveEntities(exists ? entities.map(x => x.id === id ? { ...x, ...row } : x) : entities.concat(row), [row]);
+    setMsg(exists ? 'Portfolio updated — ' + row.name : 'Portfolio added — ' + row.name + '. It is now in every portfolio picker.');
+  };
+  const archiveEntity = e => {
+    if (e.kind === 'head_office') { window.alert('Head Office is the main book and cannot be removed.'); return; }
+    const n = txns.filter(t => locName(t.location) === e.name).length;
+    const accs = accounts.filter(a => !a.archived && (a.entity || HQ_ID) === e.id).length;
+    if (!window.confirm('Archive ' + e.name + '?' + (n ? ' Its ' + n + ' transaction' + (n > 1 ? 's' : '') + ' stay in the books and reports.' : '')
+      + (accs ? ' ' + accs + ' account' + (accs > 1 ? 's' : '') + ' will be hidden with it.' : ''))) return;
+    saveEntities(entities.map(x => x.id === e.id ? { ...x, archived:true } : x), [{ ...e, archived:true }]);
+  };
+  const seedAccounts = () => {
+    const rows = SEED_ACCOUNTS.map((a,i) => ({ ...a, id:uid(), sort:i * 10, anchor_date:todayIso(), anchor_balance:0 }));
+    setAccounts(prev => { const next = prev.concat(rows); lsSet(LS.acc, next); return next; });
+    cloudWrite('bk_accounts', rows.map(a => accToRow(a, user)));
+    setMsg('Six accounts added — set each one’s opening balance from your banking app when you get a chance.');
+  };
+  const saveMember = m => {
+    const email = String(m.email || '').toLowerCase();
+    const exists = members.some(x => x.email === email);
+    const next = exists ? members.map(x => x.email === email ? { ...x, ...m, email } : x) : members.concat({ ...m, email });
+    setMembers(next); lsSet(MEM_KEY, next);
+    cloudWrite('bk_members', [memToRow({ ...m, email }, user)]);
+    setMsg((exists ? 'Access updated' : 'Added') + ' — ' + email + ' · ' + roleLabel(m.role));
+  };
+  const deleteMember = m => {
+    const owners = members.filter(x => x.role === 'owner');
+    if (m.role === 'owner' && owners.length < 2) { window.alert('There has to be at least one owner. Make someone else an owner first.'); return; }
+    if (!window.confirm('Remove ' + m.email + '’s access?')) return;
+    const next = members.filter(x => x.email !== m.email);
+    setMembers(next); lsSet(MEM_KEY, next);
+    if (token) supaDelete(token, 'bk_members', m.email).catch(() => {});
+  };
   const saveCatStore = (next, changedRows) => {
     lsSet(CATSTORE_KEY, next);
     rebuildCats(next);
@@ -3447,6 +3724,15 @@ function App() {
   const [msg, setMsg] = useState('');
   const [busy, setBusy] = useState(false);
   const [setupNeeded, setSetupNeeded] = useState([]); // names of cloud tables the database doesn't have yet
+  /* what the signed-in person is allowed to do. While nobody has been added to
+     People & access, the books stay wide open so the first person can set it up. */
+  const myRole = useMemo(() => {
+    if (!token) return 'owner';                       // working locally, on your own machine
+    if (!members.length) return 'owner';              // nobody configured access yet
+    const me = members.find(m => m.email === String(user || '').toLowerCase());
+    return me ? me.role : 'viewer';
+  }, [token, members, user]);
+  const can = useMemo(() => permsFor(myRole), [myRole]);
   /* the login screen only appears when the user asks for it — the app opens
      straight into the books, working locally, until they choose to sign in */
   const [showLogin, setShowLogin] = useState(false);
@@ -3558,6 +3844,37 @@ function App() {
       } catch (e4) {
         // sign-offs unavailable → payroll falls back to period-end dating
       }
+      // portfolios — head office plus a book per clinic
+      try {
+        const entRows = await supaSelect(t, 'bk_entities', 'select=*');
+        if (entRows.length) {
+          const srv = entRows.map(entFromRow);
+          const ids = new Set(srv.map(x => x.id));
+          const localOnly = entities.filter(x => !ids.has(x.id));
+          if (localOnly.length) await supaUpsert(t, 'bk_entities', localOnly.map(x => entToRow(x, user)));
+          const merged = srv.concat(localOnly);
+          const next = rebuildEntities(merged).slice();
+          setEntities(next); lsSet(ENT_KEY, next);
+        } else {
+          await supaUpsert(t, 'bk_entities', entities.map(x => entToRow(x, user)));
+        }
+        setSetupNeeded(prev => prev.filter(x => x !== 'bk_entities'));
+      } catch (e6) {
+        if (/does not exist|Could not find/i.test(e6.message)) setSetupNeeded(prev => prev.indexOf('bk_entities') > -1 ? prev : prev.concat('bk_entities'));
+      }
+      // who has access
+      try {
+        const memRows = await supaSelect(t, 'bk_members', 'select=*');
+        const srv = memRows.map(memFromRow);
+        const emails = new Set(srv.map(x => x.email));
+        const localOnly = members.filter(x => !emails.has(x.email));
+        if (localOnly.length) await supaUpsert(t, 'bk_members', localOnly.map(x => memToRow(x, user)));
+        const merged = srv.concat(localOnly);
+        setMembers(merged); lsSet(MEM_KEY, merged);
+        setSetupNeeded(prev => prev.filter(x => x !== 'bk_members'));
+      } catch (e7) {
+        if (/does not exist|Could not find/i.test(e7.message)) setSetupNeeded(prev => prev.indexOf('bk_members') > -1 ? prev : prev.concat('bk_members'));
+      }
       // editable chart of accounts — custom categories & renames follow you across machines
       try {
         const catRows = await supaSelect(t, 'bk_categories', 'select=*');
@@ -3650,7 +3967,14 @@ function App() {
     // eslint-disable-next-line
   }, [token, refreshTok]);
   /* ---------- mutations ---------- */
-  const saveTxns = (rows, batchMeta) => {
+  const saveTxns = (rows0, batchMeta) => {
+    /* an account belongs to a portfolio, so anything imported from it is
+       attributed there unless the row already says otherwise */
+    const rows = rows0.map(t => {
+      if (t.location || !t.account_id) return t;
+      const a = accounts.find(x => x.id === t.account_id);
+      return a ? { ...t, location:entLabel(a.entity || HQ_ID) } : t;
+    });
     setTxns(prev => {
       const map = {}; prev.forEach(t => map[t.id] = t);
       rows.forEach(t => map[t.id] = t);
@@ -3721,6 +4045,7 @@ function App() {
           h('h1', null, 'Revibe Books'),
           h('div', { className:'sub' }, 'Clinic bookkeeping · expenses, cash & accountant-ready reports'))),
       h('div', { style:{ display:'flex', gap:8, alignItems:'center', flexWrap:'wrap' } },
+        token && roleRank(myRole) < 4 ? h('span', { className:'badge b-purple', title:'Your access level — an owner can change it in Settings → People & access' }, roleLabel(myRole)) : null,
         token
           ? h('span', { className:'badge b-green', title:'Signed in' }, user)
           : h('span', { className:'badge b-amber', title:'Working locally — changes are kept in this browser and sync when you sign in' }, 'Local only — not synced'),
@@ -3736,19 +4061,20 @@ function App() {
     h('div', { className:'tabs no-print' }, TABS.map(([id, label]) =>
       h('button', { key:id, className:'tab' + (tab === id ? ' on' : ''), onClick:() => setTab(id) }, label))),
     tab === 'overview' ? h(OverviewTab, { txns, accounts, recs, ledger, settings, payCash }) : null,
-    tab === 'ledger' ? h(LedgerTab, { txns, accounts, onSave:saveTxns, onDelete:deleteTx, onUpdateAR:updateAR, onUpdatePayouts:updatePayouts, onSaveClaims:saveClaims, batches, onDeleteBatch:deleteBatch, reconciledIds:cashRecon.reconciledIds }) : null,
+    tab === 'ledger' ? h(LedgerTab, { can, txns, accounts, onSave:saveTxns, onDelete:deleteTx, onUpdateAR:updateAR, onUpdatePayouts:updatePayouts, onSaveClaims:saveClaims, batches, onDeleteBatch:deleteBatch, reconciledIds:cashRecon.reconciledIds }) : null,
     tab === 'reconcile' ? h(ReconcileTab, { recon:cashRecon, payouts, signedIn:!!token }) : null,
     tab === 'revenue' ? h(RevenueTab, { revLines, txns, signedIn:!!token, ar, payouts, claims }) : null,
     tab === 'payroll' ? h(PayrollTab, { ledger, settings, signedIn:!!token, payCash }) : null,
     tab === 'accountant' ? h(AccountantTab, { txns, ledger, settings, accounts, payCash }) : null,
     tab === 'budget' ? h(BudgetTab, { txns, buds, ledger, settings, onSetBudget:setBudget, payCash }) : null,
-    tab === 'settings' ? h(SettingsTab, { accounts, recs, settings, catStore, onSaveAccount:saveAccount, onSaveRecurring:saveRecurring, onDeleteRecurring:deleteRecurring, onSetSettings:setSettingsAll, onAddCat:addCustomCat, onUpdCat:updCat, onDelCat:delCustomCat, onManageCats:() => { const el = document.getElementById('cat-editor'); if (el && el.scrollIntoView) el.scrollIntoView({ behavior:'smooth', block:'start' }); } }) : null,
+    tab === 'settings' ? h(SettingsTab, { accounts, recs, settings, catStore, onSaveAccount:saveAccount, onSaveRecurring:saveRecurring, onDeleteRecurring:deleteRecurring, onSetSettings:setSettingsAll, onAddCat:addCustomCat, onUpdCat:updCat, onDelCat:delCustomCat,
+      txns, can, members, myEmail:user, entities, onSaveEntity:saveEntity, onArchiveEntity:archiveEntity, onSeedAccounts:seedAccounts, onSaveMember:saveMember, onDeleteMember:deleteMember, onManageCats:() => { const el = document.getElementById('cat-editor'); if (el && el.scrollIntoView) el.scrollIntoView({ behavior:'smooth', block:'start' }); } }) : null,
     tab === 'guide' ? h(GuideTab) : null,
     h('div', { className:'footer' }, 'Revibe Books · fed by the payroll dashboard ledger · bank & Jane CSV imports · accountant-ready exports',
       h('span', { style:{ display:'block', marginTop:6, fontWeight:600, color:'var(--pine)' } }, 'build ' + window.__BUILD)));
 }
 /* pure functions exposed for automated smoke-testing; harmless in production */
-window.__BK = { loadCatStore, rebuildCats, mergeCatStores, catToCloudRow, PROTECTED_CATS, BASE_CATS, getCats:() => CATS, parseDateAny, parseMoneyAny, sniffBankColumns, normalizeBankCsv, normalizeJaneFees, autoCategory, rollup, hstIn, txHash, payrollByMonth, nextPayrollEstimate, upcomingRecurring, readXlsxRows, parseJaneMonthly, guessJaneYear, buildJaneMonthlyRows, monthEndIso, revenueLinesFromLedger, revenueByMonth, janeByMonth, parseJaneDaily, buildJaneDailyRows, parseJaneSales, applySalesToAR, arAgeBucket, loadAR, parseJanePayouts, applyPayouts, payoutsByMonth, applyClaims, loadClaims, buildPayrollCash, mapCategoryName, sigOf, learnPatterns, loadPatterns };
+window.__BK = { rebuildEntities, entityByName, entityById, locName, matchLocText, entToRow, entFromRow, permsFor, roleRank, roleLabel, ROLES, SEED_ACCOUNTS, ACC_TYPES, getEntities:() => ENTITIES, getLocations:() => LOCATIONS, loadCatStore, rebuildCats, mergeCatStores, catToCloudRow, PROTECTED_CATS, BASE_CATS, getCats:() => CATS, parseDateAny, parseMoneyAny, sniffBankColumns, normalizeBankCsv, normalizeJaneFees, autoCategory, rollup, hstIn, txHash, payrollByMonth, nextPayrollEstimate, upcomingRecurring, readXlsxRows, parseJaneMonthly, guessJaneYear, buildJaneMonthlyRows, monthEndIso, revenueLinesFromLedger, revenueByMonth, janeByMonth, parseJaneDaily, buildJaneDailyRows, parseJaneSales, applySalesToAR, arAgeBucket, loadAR, parseJanePayouts, applyPayouts, payoutsByMonth, applyClaims, loadClaims, buildPayrollCash, mapCategoryName, sigOf, learnPatterns, loadPatterns };
 ReactDOM.createRoot(document.getElementById('root')).render(h(App));
   }catch(e){ showError((e&&(e.message||String(e)))||'Unknown error'); if(window.console) console.error(e); }
 })();
